@@ -25,8 +25,8 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .base import BaseStageLabelGenerator, StageLabelOutput
 from .utils import (
-    compute_mean_abs_motion,
-    extract_action_chunk_tensor,
+    compute_mean_abs_signal,
+    extract_single_action_tensor_with_reason,
     extract_latest_state_tensor,
     lookup_sample_value,
     normalize_index_sequence,
@@ -37,12 +37,12 @@ from .utils import (
 
 @dataclass
 class HardStageLabelGeneratorConfig:
-    """Configuration for rule-based hard stage label generation.
+    """Configuration for rule-based hard stage label generation from one action.
 
     Attributes:
         state_key: Key used to read the current state from a sample.
-        action_key_candidates: Candidate keys used to find the current action or
-            an action chunk in a sample. The first matching key is used.
+        action_key_candidates: Candidate keys used to find the current single-step
+            action in a sample. The first matching key is used.
         move_stage_id: Integer id used for the `move` stage.
         grasp_stage_id: Integer id used for the `grasp` stage.
         place_stage_id: Integer id used for the `place` stage.
@@ -84,7 +84,7 @@ class HardStageLabelGeneratorConfig:
     """
 
     state_key: str = OBS_STATE
-    action_key_candidates: tuple[str, ...] = (ACTION, "actions", "action_chunk", "future_actions")
+    action_key_candidates: tuple[str, ...] = (ACTION, "actions")
 
     move_stage_id: int = 0
     grasp_stage_id: int = 1
@@ -168,7 +168,7 @@ class HardStageLabelGeneratorConfig:
 
 
 class HardStageLabelGenerator(BaseStageLabelGenerator):
-    """Rule-based hard-label generator for coarse SmolVLA stage supervision.
+    """Rule-based hard-label generator for coarse single-step stage supervision.
 
     The first implementation intentionally stays simple and model-agnostic. It only
     consumes sample-level state/action data and emits one of three hard labels:
@@ -177,8 +177,8 @@ class HardStageLabelGenerator(BaseStageLabelGenerator):
     - `1 = grasp`
     - `2 = place`
 
-    The generator prefers action-derived signals and uses gripper state as an
-    additional hint when available.
+    The generator uses the current sample's single-step action as its primary
+    signal and optionally consults the latest gripper state when available.
     """
 
     def __init__(self, cfg: HardStageLabelGeneratorConfig | Mapping[str, Any] | Any | None = None):
@@ -202,16 +202,19 @@ class HardStageLabelGenerator(BaseStageLabelGenerator):
         action_value, action_key = self._find_action_value(sample)
 
         state_tensor = extract_latest_state_tensor(state_value)
-        action_chunk = extract_action_chunk_tensor(action_value)
-        if action_chunk is None:
+        action_vector, action_reason, action_debug = extract_single_action_tensor_with_reason(
+            action_value
+        )
+        if action_vector is None:
             return self._invalid_output(
-                reason="missing_action",
+                reason=action_reason or "missing_action",
                 sample=sample,
                 action_key=action_key,
                 state_available=state_tensor is not None,
+                extra_debug=action_debug,
             )
 
-        action_dim = int(action_chunk.shape[-1])
+        action_dim = int(action_vector.shape[-1])
         gripper_action_indices = self._resolve_gripper_action_indices(action_dim)
         if not gripper_action_indices:
             return self._invalid_output(
@@ -229,7 +232,7 @@ class HardStageLabelGenerator(BaseStageLabelGenerator):
             small_joint_indices=self.cfg.small_joint_indices,
         )
 
-        gripper_action = action_chunk[:, gripper_action_indices]
+        gripper_action = action_vector[gripper_action_indices]
         gripper_action_mean = float(gripper_action.mean().item())
         if self.cfg.gripper_close_is_negative:
             close_command = gripper_action_mean <= -self.cfg.gripper_close_action_threshold
@@ -238,9 +241,9 @@ class HardStageLabelGenerator(BaseStageLabelGenerator):
             close_command = gripper_action_mean >= self.cfg.gripper_close_action_threshold
             open_command = gripper_action_mean <= -self.cfg.gripper_open_action_threshold
 
-        arm_motion = compute_mean_abs_motion(action_chunk, arm_indices)
-        large_joint_motion = compute_mean_abs_motion(action_chunk, large_joint_indices)
-        small_joint_motion = compute_mean_abs_motion(action_chunk, small_joint_indices)
+        arm_motion = compute_mean_abs_signal(action_vector, arm_indices)
+        large_joint_motion = compute_mean_abs_signal(action_vector, large_joint_indices)
+        small_joint_motion = compute_mean_abs_signal(action_vector, small_joint_indices)
 
         gripper_state_value = None
         gripper_is_closed = None
@@ -264,7 +267,7 @@ class HardStageLabelGenerator(BaseStageLabelGenerator):
             gripper_is_open=gripper_is_open,
         )
 
-        output_device = action_chunk.device
+        output_device = action_vector.device
         return StageLabelOutput(
             stage_id=torch.tensor(stage_id, dtype=torch.long, device=output_device),
             stage_prob_target=None,
@@ -274,6 +277,7 @@ class HardStageLabelGenerator(BaseStageLabelGenerator):
                 "decision_reason": decision_reason,
                 "stage_name": self.stage_names.get(stage_id, "unknown"),
                 "action_key": action_key,
+                "action_semantics": "single_step_action",
                 "state_key": self.cfg.state_key,
                 "gripper_action_mean": gripper_action_mean,
                 "arm_motion": arm_motion,
@@ -342,20 +346,26 @@ class HardStageLabelGenerator(BaseStageLabelGenerator):
         sample: Mapping[str, Any],
         action_key: str | None,
         state_available: bool,
+        extra_debug: dict[str, Any] | None = None,
     ) -> StageLabelOutput:
         """Return a unified invalid label output when the sample lacks signal."""
+        stage_debug = {
+            "decision_reason": reason,
+            "action_key": action_key,
+            "action_semantics": "single_step_action",
+            "state_key": self.cfg.state_key,
+            "available_keys": sorted(sample.keys()),
+            "state_available": state_available,
+        }
+        if extra_debug:
+            stage_debug.update(extra_debug)
+
         return StageLabelOutput(
             stage_id=None,
             stage_prob_target=None,
             stage_valid_mask=torch.tensor(False, dtype=torch.bool),
             stage_source="hard",
-            stage_debug={
-                "decision_reason": reason,
-                "action_key": action_key,
-                "state_key": self.cfg.state_key,
-                "available_keys": sorted(sample.keys()),
-                "state_available": state_available,
-            },
+            stage_debug=stage_debug,
         )
 
     def _find_action_value(self, sample: Mapping[str, Any]) -> tuple[Any | None, str | None]:

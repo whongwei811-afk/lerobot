@@ -134,6 +134,11 @@ def extract_latest_state_tensor(value: Any | None) -> torch.Tensor | None:
 def extract_action_chunk_tensor(value: Any | None) -> torch.Tensor | None:
     """Convert an action-like value into a `(T, D)` action-chunk tensor.
 
+    Legacy note:
+        This helper remains only for legacy/internal chunk-based code paths.
+        Current public hard/soft stage-label generators use
+        `extract_single_action_tensor_with_reason(...)` instead.
+
     The behavior matches the current hard-label generator:
     - `(D,)` becomes `(1, D)`
     - `(T, D)` stays `(T, D)`
@@ -156,6 +161,55 @@ def extract_action_chunk_tensor(value: Any | None) -> torch.Tensor | None:
     if tensor.ndim >= 2:
         return tensor.reshape(-1, tensor.shape[-1])
     return None
+
+
+def extract_single_action_tensor_with_reason(
+    value: Any | None,
+) -> tuple[torch.Tensor | None, str | None, dict[str, Any]]:
+    """Convert an action-like value into a single-step action tensor of shape `(D,)`.
+
+    Supported shapes:
+    - `(D,)`: returned as-is
+    - `(1, D)`: squeezed to `(D,)`
+
+    Rejected shapes:
+    - `(T, D)` with `T > 1`
+    - any tensor with rank other than 1 or 2
+
+    Args:
+        value: Action-like content from a sample.
+
+    Returns:
+        A tuple `(action_tensor, reason, debug)` where:
+        - `action_tensor` is a detached 1D tensor on success, otherwise `None`
+        - `reason` is `None` on success, otherwise one of:
+            - `"missing_action"`
+            - `"unsupported_multi_step_action"`
+            - `"invalid_action_shape"`
+        - `debug` carries lightweight shape/type metadata for invalid cases
+    """
+    if value is None:
+        return None, "missing_action", {}
+
+    tensor = coerce_to_tensor(value)
+    if tensor is None:
+        return None, "missing_action", {"action_value_type": type(value).__name__}
+
+    tensor = tensor.detach()
+    if tensor.ndim == 1:
+        return tensor, None, {}
+    if tensor.ndim == 2 and tensor.shape[0] == 1:
+        return tensor.squeeze(0), None, {}
+    if tensor.ndim == 2:
+        return None, "unsupported_multi_step_action", {"action_shape": tuple(tensor.shape)}
+
+    return None, "invalid_action_shape", {"action_shape": tuple(tensor.shape)}
+
+
+def extract_single_action_tensor(value: Any | None) -> torch.Tensor | None:
+    """Backward-compatible wrapper around single-step action extraction."""
+    action_tensor, _, _ = extract_single_action_tensor_with_reason(value)
+    return action_tensor
 
 
 def normalize_index_sequence(indices: Sequence[int] | None, size: int) -> list[int]:
@@ -246,3 +300,26 @@ def compute_mean_abs_motion(action_chunk: torch.Tensor, indices: Sequence[int]) 
     if not indices:
         return 0.0
     return float(action_chunk[:, list(indices)].abs().mean().item())
+
+
+def compute_mean_abs_signal(action_vector: torch.Tensor, indices: Sequence[int]) -> float:
+    """Compute mean absolute value over selected dimensions of one action vector.
+
+    Args:
+        action_vector: Single-step action tensor with shape `(D,)`.
+        indices: Action dimensions to include in the statistic.
+
+    Returns:
+        Mean absolute value across the selected action dimensions. Returns `0.0`
+        when `indices` is empty.
+
+    Raises:
+        ValueError: If `action_vector` is not a 1D tensor.
+    """
+    if not indices:
+        return 0.0
+    if action_vector.ndim != 1:
+        raise ValueError(
+            f"`action_vector` must have shape (D,), got {tuple(action_vector.shape)}."
+        )
+    return float(action_vector[list(indices)].abs().mean().item())

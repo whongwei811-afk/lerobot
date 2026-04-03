@@ -83,7 +83,7 @@ class StageLabelStatistics:
         self.valid_samples = 0
         self.invalid_samples = 0
 
-        # Stage distribution (for hard and pseudo labels)
+        # Stage distribution (for discrete hard labels)
         self.stage_id_counts = Counter()
         self.stage_name_counts = Counter()
 
@@ -164,15 +164,19 @@ class StageLabelStatistics:
         if is_valid:
             self.valid_samples += 1
 
-            # Process hard/pseudo labels
-            if isinstance(stage_id, torch.Tensor):
+            # Process discrete stage ids only for samples that truly came from the hard generator.
+            if stage_source == "hard" and isinstance(stage_id, torch.Tensor):
                 sid = int(stage_id.item()) if stage_id.numel() == 1 else int(stage_id)
                 self.stage_id_counts[sid] += 1
                 if "stage_name" in stage_debug:
                     self.stage_name_counts[stage_debug["stage_name"]] += 1
 
-            # Process soft labels
-            if isinstance(stage_prob_target, torch.Tensor) and stage_prob_target.numel() > 0:
+            # Process soft labels only for samples that truly came from the soft generator.
+            if (
+                stage_source == "soft"
+                and isinstance(stage_prob_target, torch.Tensor)
+                and stage_prob_target.numel() > 0
+            ):
                 prob_np = stage_prob_target.detach().cpu().numpy().astype(np.float32)
                 self.soft_label_probs.append(prob_np)
                 self.soft_label_max_probs.append(float(np.max(prob_np)))

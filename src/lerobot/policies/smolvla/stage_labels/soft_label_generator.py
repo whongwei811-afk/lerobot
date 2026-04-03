@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, fields
 from typing import Any, Mapping
 
@@ -25,8 +26,8 @@ from lerobot.utils.constants import ACTION
 
 from .base import BaseStageLabelGenerator, StageLabelOutput
 from .utils import (
-    compute_mean_abs_motion,
-    extract_action_chunk_tensor,
+    compute_mean_abs_signal,
+    extract_single_action_tensor_with_reason,
     lookup_sample_value,
     normalize_index_sequence,
     resolve_joint_groups,
@@ -35,13 +36,11 @@ from .utils import (
 
 @dataclass
 class SoftStageLabelGeneratorConfig:
-    """Configuration for action-target-chunk soft stage label generation.
+    """Configuration for single-step-action soft stage label generation.
 
     Attributes:
-        action_chunk_key_candidates: Candidate keys used to find the sample-aligned
-            action target chunk. The first matching key is used.
-        min_chunk_steps: Minimum number of chunk steps required to generate a soft
-            label distribution.
+        action_key_candidates: Candidate keys used to find the current single-step
+            action. The first matching key is used.
         move_stage_id: Integer id used for the `move` stage.
         grasp_stage_id: Integer id used for the `grasp` stage.
         place_stage_id: Integer id used for the `place` stage.
@@ -49,8 +48,8 @@ class SoftStageLabelGeneratorConfig:
             generated probability vector itself always follows the semantic class
             order `[move, grasp, place]`, exposed through `stage_order`.
         gripper_action_indices: Optional indices of gripper-related dimensions in
-            the action target chunk. If missing, the trailing
-            `default_gripper_width` dimensions are used as a fallback.
+            the action vector. If missing, the trailing `default_gripper_width`
+            dimensions are used as a fallback.
         default_gripper_width: Number of trailing action dimensions to interpret as
             gripper controls when `gripper_action_indices` is not provided.
         large_joint_indices: Optional indices for large/proximal arm joints in the
@@ -59,10 +58,8 @@ class SoftStageLabelGeneratorConfig:
             action vector.
         gripper_close_is_negative: Whether negative gripper action values mean the
             gripper is closing.
-        use_gripper_trend_signal: Whether close/open trend statistics should
-            contribute to the soft stage scores.
-        gripper_trend_threshold: Threshold used to normalize directional gripper
-            trend strength.
+        gripper_action_threshold: Threshold used when converting the current
+            gripper command into close/open strengths.
         min_total_energy: Minimum combined motion energy required to produce a
             valid soft label distribution.
         temperature: Softmax temperature applied to the stage logits.
@@ -78,27 +75,21 @@ class SoftStageLabelGeneratorConfig:
             `grasp` logit.
         grasp_gripper_weight: Weight for gripper energy ratio in the `grasp`
             logit.
-        grasp_close_trend_weight: Weight for closing trend strength in the `grasp`
+        grasp_close_action_weight: Weight for closing strength in the `grasp`
             logit.
-        grasp_open_trend_penalty: Penalty for opening trend strength in the
-            `grasp` logit.
+        grasp_open_action_penalty: Penalty for opening strength in the `grasp`
+            logit.
         place_small_joint_weight: Weight for small-joint energy ratio in the
             `place` logit.
         place_gripper_weight: Weight for gripper energy ratio in the `place`
             logit.
-        place_open_trend_weight: Weight for opening trend strength in the `place`
+        place_open_action_weight: Weight for opening strength in the `place`
             logit.
-        place_close_trend_penalty: Penalty for closing trend strength in the
-            `place` logit.
+        place_close_action_penalty: Penalty for closing strength in the `place`
+            logit.
     """
 
-    action_chunk_key_candidates: tuple[str, ...] = (
-        "future_actions",
-        "action_chunk",
-        "actions",
-        ACTION,
-    )
-    min_chunk_steps: int = 2
+    action_key_candidates: tuple[str, ...] = (ACTION, "actions")
 
     move_stage_id: int = 0
     grasp_stage_id: int = 1
@@ -111,8 +102,7 @@ class SoftStageLabelGeneratorConfig:
     small_joint_indices: tuple[int, ...] | None = None
 
     gripper_close_is_negative: bool = True
-    use_gripper_trend_signal: bool = True
-    gripper_trend_threshold: float = 0.02
+    gripper_action_threshold: float = 0.02
 
     min_total_energy: float = 1e-4
     temperature: float = 1.0
@@ -127,13 +117,13 @@ class SoftStageLabelGeneratorConfig:
 
     grasp_small_joint_weight: float = 1.2
     grasp_gripper_weight: float = 1.0
-    grasp_close_trend_weight: float = 1.5
-    grasp_open_trend_penalty: float = 0.6
+    grasp_close_action_weight: float = 1.5
+    grasp_open_action_penalty: float = 0.6
 
     place_small_joint_weight: float = 1.2
     place_gripper_weight: float = 1.0
-    place_open_trend_weight: float = 1.5
-    place_close_trend_penalty: float = 0.6
+    place_open_action_weight: float = 1.5
+    place_close_action_penalty: float = 0.6
 
     def __post_init__(self) -> None:
         """Validate configuration values for consistent soft-label generation."""
@@ -143,17 +133,15 @@ class SoftStageLabelGeneratorConfig:
                 "`move_stage_id`, `grasp_stage_id`, and `place_stage_id` must be distinct. "
                 f"Got {stage_ids}."
             )
-        if not self.action_chunk_key_candidates:
-            raise ValueError("`action_chunk_key_candidates` must not be empty.")
-        if self.min_chunk_steps <= 0:
-            raise ValueError(f"`min_chunk_steps` must be > 0, got {self.min_chunk_steps}.")
+        if not self.action_key_candidates:
+            raise ValueError("`action_key_candidates` must not be empty.")
         if self.default_gripper_width < 0:
             raise ValueError(
                 f"`default_gripper_width` must be >= 0, got {self.default_gripper_width}."
             )
 
         self._validate_positive("temperature", self.temperature)
-        self._validate_non_negative("gripper_trend_threshold", self.gripper_trend_threshold)
+        self._validate_non_negative("gripper_action_threshold", self.gripper_action_threshold)
         self._validate_non_negative("min_total_energy", self.min_total_energy)
 
     @staticmethod
@@ -179,20 +167,35 @@ class SoftStageLabelGeneratorConfig:
             return cfg
 
         field_names = {field_.name for field_ in fields(cls)}
+        legacy_aliases = {
+            "action_chunk_key_candidates": "action_key_candidates",
+            "grasp_close_trend_weight": "grasp_close_action_weight",
+            "grasp_open_trend_penalty": "grasp_open_action_penalty",
+            "place_open_trend_weight": "place_open_action_weight",
+            "place_close_trend_penalty": "place_close_action_penalty",
+        }
+
         if isinstance(cfg, Mapping):
-            data = {key: value for key, value in cfg.items() if key in field_names}
-            return cls(**data)
+            data = dict(cfg)
+            for legacy_name, new_name in legacy_aliases.items():
+                if new_name not in data and legacy_name in data:
+                    data[new_name] = data[legacy_name]
+            filtered = {key: value for key, value in data.items() if key in field_names}
+            return cls(**filtered)
 
         data = {name: getattr(cfg, name) for name in field_names if hasattr(cfg, name)}
+        for legacy_name, new_name in legacy_aliases.items():
+            if new_name not in data and hasattr(cfg, legacy_name):
+                data[new_name] = getattr(cfg, legacy_name)
         return cls(**data)
 
 
 class SoftStageLabelGenerator(BaseStageLabelGenerator):
-    """Generate soft stage-label distributions from action-target-chunk statistics.
+    """Generate soft stage-label distributions from a single-step action.
 
     The generator is model-agnostic and produces a normalized probability vector
-    over the three stage classes using coarse action-group statistics and optional
-    gripper direction trends.
+    over the three stage classes using coarse action-group statistics and current
+    gripper close/open command strength.
 
     The output probability vector always uses the semantic class order
     `[move, grasp, place]`. This ordering is reported in `stage_debug["stage_order"]`
@@ -209,43 +212,28 @@ class SoftStageLabelGenerator(BaseStageLabelGenerator):
         }
 
     def generate(self, sample: Mapping[str, Any], **kwargs: Any) -> StageLabelOutput:
-        """Generate a soft stage label distribution from a single sample.
-
-        Args:
-            sample: A single dataset sample or sample-like mapping.
-            **kwargs: Unused extension point for future generator-specific options.
-
-        Returns:
-            A `StageLabelOutput` containing `stage_prob_target` when a usable
-            action target chunk is available, otherwise an invalid output.
-        """
+        """Generate a soft stage label distribution from one sample's action."""
         del kwargs
 
-        chunk_value, action_key = self._find_action_chunk_value(sample)
-        action_chunk = extract_action_chunk_tensor(chunk_value)
-        if action_chunk is None:
+        action_value, action_key = self._find_action_value(sample)
+        action_vector, action_reason, action_debug = extract_single_action_tensor_with_reason(
+            action_value
+        )
+        if action_vector is None:
             return self._invalid_output(
-                reason="missing_action_target_chunk",
+                reason=action_reason or "missing_action",
                 sample=sample,
                 action_key=action_key,
+                extra_debug=action_debug,
             )
 
-        if action_chunk.shape[0] < self.cfg.min_chunk_steps:
-            return self._invalid_output(
-                reason="insufficient_action_target_chunk_length",
-                sample=sample,
-                action_key=action_key,
-                chunk_length=int(action_chunk.shape[0]),
-            )
-
-        action_dim = int(action_chunk.shape[-1])
+        action_dim = int(action_vector.shape[-1])
         gripper_action_indices = self._resolve_gripper_action_indices(action_dim)
         if not gripper_action_indices:
             return self._invalid_output(
                 reason="missing_gripper_action_dims",
                 sample=sample,
                 action_key=action_key,
-                chunk_length=int(action_chunk.shape[0]),
             )
 
         arm_indices = [index for index in range(action_dim) if index not in gripper_action_indices]
@@ -256,50 +244,39 @@ class SoftStageLabelGenerator(BaseStageLabelGenerator):
             small_joint_indices=self.cfg.small_joint_indices,
         )
 
-        large_joint_energy = compute_mean_abs_motion(action_chunk, large_joint_indices)
-        small_joint_energy = compute_mean_abs_motion(action_chunk, small_joint_indices)
-        gripper_energy = compute_mean_abs_motion(action_chunk, gripper_action_indices)
+        large_joint_energy = compute_mean_abs_signal(action_vector, large_joint_indices)
+        small_joint_energy = compute_mean_abs_signal(action_vector, small_joint_indices)
+        gripper_energy = compute_mean_abs_signal(action_vector, gripper_action_indices)
         total_energy = large_joint_energy + small_joint_energy + gripper_energy
 
-        # CRITICAL FIX: Check for NaN/inf values that can propagate through computation
-        if not (
-            all(isinstance(e, float) for e in [large_joint_energy, small_joint_energy, gripper_energy])
+        if not all(
+            isinstance(energy, float)
+            for energy in (large_joint_energy, small_joint_energy, gripper_energy, total_energy)
         ):
             return self._invalid_output(
                 reason="non_numeric_energy_values",
                 sample=sample,
                 action_key=action_key,
-                chunk_length=int(action_chunk.shape[0]),
             )
 
-        import math
-        for energy_val, energy_name in [
-            (large_joint_energy, "large_joint_energy"),
-            (small_joint_energy, "small_joint_energy"),
-            (gripper_energy, "gripper_energy"),
-            (total_energy, "total_energy"),
-        ]:
-            if not math.isfinite(energy_val):
-                return self._invalid_output(
-                    reason=f"non_finite_{energy_name}",
-                    sample=sample,
-                    action_key=action_key,
-                    chunk_length=int(action_chunk.shape[0]),
-                    extra_debug={
-                        "large_joint_energy": large_joint_energy,
-                        "small_joint_energy": small_joint_energy,
-                        "gripper_energy": gripper_energy,
-                        "total_energy": total_energy,
-                        "failing_energy": energy_name,
-                    },
-                )
+        if not math.isfinite(total_energy):
+            return self._invalid_output(
+                reason="non_finite_total_energy",
+                sample=sample,
+                action_key=action_key,
+                extra_debug={
+                    "large_joint_energy": large_joint_energy,
+                    "small_joint_energy": small_joint_energy,
+                    "gripper_energy": gripper_energy,
+                    "total_energy": total_energy,
+                },
+            )
 
-        if total_energy < self.cfg.min_total_energy:
+        if total_energy <= self.cfg.min_total_energy:
             return self._invalid_output(
                 reason="insufficient_total_motion_energy",
                 sample=sample,
                 action_key=action_key,
-                chunk_length=int(action_chunk.shape[0]),
                 extra_debug={
                     "large_joint_energy": large_joint_energy,
                     "small_joint_energy": small_joint_energy,
@@ -313,14 +290,15 @@ class SoftStageLabelGenerator(BaseStageLabelGenerator):
             small_joint_energy=small_joint_energy,
             gripper_energy=gripper_energy,
         )
-        gripper_trend_stats = self._compute_gripper_trend_stats(action_chunk[:, gripper_action_indices])
-        close_strength, open_strength = self._compute_gripper_direction_strengths(gripper_trend_stats)
+        gripper_action_mean = float(action_vector[gripper_action_indices].mean().item())
+        close_strength, open_strength = self._compute_gripper_direction_strengths(gripper_action_mean)
+        logit_dtype = action_vector.dtype if torch.is_floating_point(action_vector) else torch.float32
         logits = self._compute_stage_logits(
             energy_stats=energy_stats,
             close_strength=close_strength,
             open_strength=open_strength,
-            device=action_chunk.device,
-            dtype=action_chunk.dtype,
+            device=action_vector.device,
+            dtype=logit_dtype,
         )
         probabilities = torch.softmax(logits / self.cfg.temperature, dim=0)
 
@@ -329,7 +307,6 @@ class SoftStageLabelGenerator(BaseStageLabelGenerator):
                 reason="non_finite_stage_probabilities",
                 sample=sample,
                 action_key=action_key,
-                chunk_length=int(action_chunk.shape[0]),
                 extra_debug={
                     "logits": logits.detach().cpu().tolist(),
                     "temperature": self.cfg.temperature,
@@ -339,19 +316,17 @@ class SoftStageLabelGenerator(BaseStageLabelGenerator):
         return StageLabelOutput(
             stage_id=None,
             stage_prob_target=probabilities,
-            stage_valid_mask=torch.tensor(True, dtype=torch.bool, device=action_chunk.device),
+            stage_valid_mask=torch.tensor(True, dtype=torch.bool, device=action_vector.device),
             stage_source="soft",
             stage_debug={
                 "action_key": action_key,
-                "chunk_semantics": "action_target_chunk",
-                "chunk_length": int(action_chunk.shape[0]),
+                "action_semantics": "single_step_action",
                 "stage_order": self._stage_probability_order(),
                 "large_joint_energy": large_joint_energy,
                 "small_joint_energy": small_joint_energy,
                 "gripper_energy": gripper_energy,
                 "total_energy": total_energy,
                 **energy_stats,
-                **gripper_trend_stats,
                 "close_strength": close_strength,
                 "open_strength": open_strength,
                 "logits": logits.detach().cpu().tolist(),
@@ -370,24 +345,8 @@ class SoftStageLabelGenerator(BaseStageLabelGenerator):
         small_joint_energy: float,
         gripper_energy: float,
     ) -> dict[str, float]:
-        """Convert raw energy statistics into normalized energy ratios.
-
-        CRITICAL FIX: Added finite value checking to prevent NaN propagation.
-
-        Args:
-            large_joint_energy: Energy of large joints.
-            small_joint_energy: Energy of small joints.
-            gripper_energy: Energy of gripper.
-
-        Returns:
-            Dictionary with normalized energy ratios.
-
-        Raises:
-            ValueError: If total_energy is not finite or zero.
-        """
+        """Convert raw energy statistics into normalized energy ratios."""
         total_energy = large_joint_energy + small_joint_energy + gripper_energy
-
-        import math
         if not math.isfinite(total_energy) or total_energy <= 0:
             raise ValueError(
                 f"`total_energy` must be finite and positive, got {total_energy}. "
@@ -400,71 +359,15 @@ class SoftStageLabelGenerator(BaseStageLabelGenerator):
             "gripper_energy_ratio": gripper_energy / total_energy,
         }
 
-    def _compute_gripper_trend_stats(self, gripper_chunk: torch.Tensor) -> dict[str, float]:
-        """Compute lightweight gripper trend statistics over the chunk."""
-        if gripper_chunk.ndim != 2:
-            raise ValueError(
-                f"`gripper_chunk` must have shape (T, D_gripper), got {tuple(gripper_chunk.shape)}."
-            )
-
-        num_steps = int(gripper_chunk.shape[0])
-        midpoint = max(1, num_steps // 2)
-        first_half = gripper_chunk[:midpoint]
-        second_half = gripper_chunk[midpoint:] if midpoint < num_steps else gripper_chunk[-1:]
-
-        gripper_mean = float(gripper_chunk.mean().item())
-        first_half_mean = float(first_half.mean().item())
-        second_half_mean = float(second_half.mean().item())
-        end_minus_start = float((gripper_chunk[-1] - gripper_chunk[0]).mean().item())
-        mean_diff = float(gripper_chunk.diff(dim=0).mean().item()) if num_steps >= 2 else 0.0
-        signed_trend = 0.5 * (second_half_mean - first_half_mean) + 0.5 * mean_diff
-
-        return {
-            "gripper_mean": gripper_mean,
-            "gripper_first_half_mean": first_half_mean,
-            "gripper_second_half_mean": second_half_mean,
-            "gripper_end_minus_start": end_minus_start,
-            "gripper_mean_diff": mean_diff,
-            "gripper_signed_trend": signed_trend,
-        }
-
-    def _compute_gripper_direction_strengths(
-        self, gripper_trend_stats: Mapping[str, float]
-    ) -> tuple[float, float]:
-        """Convert gripper trend statistics into close/open direction strengths."""
-        if not self.cfg.use_gripper_trend_signal:
-            return 0.0, 0.0
-
-        signed_trend = gripper_trend_stats["gripper_signed_trend"]
-        end_minus_start = gripper_trend_stats["gripper_end_minus_start"]
-        second_half_mean = gripper_trend_stats["gripper_second_half_mean"]
-        gripper_mean = gripper_trend_stats["gripper_mean"]
-
+    def _compute_gripper_direction_strengths(self, gripper_action_mean: float) -> tuple[float, float]:
+        """Convert the current gripper action into close/open direction strengths."""
+        threshold = self.cfg.gripper_action_threshold
         if self.cfg.gripper_close_is_negative:
-            close_raw = max(
-                0.0,
-                -signed_trend - self.cfg.gripper_trend_threshold,
-            ) + max(0.0, -end_minus_start - self.cfg.gripper_trend_threshold)
-            open_raw = max(
-                0.0,
-                signed_trend - self.cfg.gripper_trend_threshold,
-            ) + max(0.0, end_minus_start - self.cfg.gripper_trend_threshold)
-            close_bias = max(0.0, -second_half_mean) + max(0.0, -gripper_mean)
-            open_bias = max(0.0, second_half_mean) + max(0.0, gripper_mean)
+            close_strength = max(0.0, -gripper_action_mean - threshold)
+            open_strength = max(0.0, gripper_action_mean - threshold)
         else:
-            close_raw = max(
-                0.0,
-                signed_trend - self.cfg.gripper_trend_threshold,
-            ) + max(0.0, end_minus_start - self.cfg.gripper_trend_threshold)
-            open_raw = max(
-                0.0,
-                -signed_trend - self.cfg.gripper_trend_threshold,
-            ) + max(0.0, -end_minus_start - self.cfg.gripper_trend_threshold)
-            close_bias = max(0.0, second_half_mean) + max(0.0, gripper_mean)
-            open_bias = max(0.0, -second_half_mean) + max(0.0, -gripper_mean)
-
-        close_strength = close_raw + 0.5 * close_bias
-        open_strength = open_raw + 0.5 * open_bias
+            close_strength = max(0.0, gripper_action_mean - threshold)
+            open_strength = max(0.0, -gripper_action_mean - threshold)
         return close_strength, open_strength
 
     def _compute_stage_logits(
@@ -496,25 +399,20 @@ class SoftStageLabelGenerator(BaseStageLabelGenerator):
             self.cfg.grasp_bias
             + self.cfg.grasp_small_joint_weight * small_ratio
             + self.cfg.grasp_gripper_weight * gripper_ratio
-            + self.cfg.grasp_close_trend_weight * close_strength
-            - self.cfg.grasp_open_trend_penalty * open_strength
+            + self.cfg.grasp_close_action_weight * close_strength
+            - self.cfg.grasp_open_action_penalty * open_strength
         )
         logits[2] = (
             self.cfg.place_bias
             + self.cfg.place_small_joint_weight * small_ratio
             + self.cfg.place_gripper_weight * gripper_ratio
-            + self.cfg.place_open_trend_weight * open_strength
-            - self.cfg.place_close_trend_penalty * close_strength
+            + self.cfg.place_open_action_weight * open_strength
+            - self.cfg.place_close_action_penalty * close_strength
         )
         return logits
 
     def _stage_probability_order(self) -> list[dict[str, int | str]]:
-        """Describe the semantic order used by `stage_prob_target`.
-
-        Returns:
-            A length-3 list where each element describes one probability position
-            in the returned soft-label vector.
-        """
+        """Describe the semantic order used by `stage_prob_target`."""
         return [
             {"index": 0, "stage_id": self.cfg.move_stage_id, "stage_name": "move"},
             {"index": 1, "stage_id": self.cfg.grasp_stage_id, "stage_name": "grasp"},
@@ -527,15 +425,14 @@ class SoftStageLabelGenerator(BaseStageLabelGenerator):
         reason: str,
         sample: Mapping[str, Any],
         action_key: str | None,
-        chunk_length: int | None = None,
         extra_debug: dict[str, Any] | None = None,
     ) -> StageLabelOutput:
         """Return a unified invalid output when no usable soft-label signal exists."""
         stage_debug = {
             "decision_reason": reason,
             "action_key": action_key,
-            "chunk_semantics": "action_target_chunk",
-            "chunk_length": chunk_length,
+            "action_semantics": "single_step_action",
+            "stage_order": self._stage_probability_order(),
             "available_keys": sorted(sample.keys()),
         }
         if extra_debug:
@@ -549,9 +446,9 @@ class SoftStageLabelGenerator(BaseStageLabelGenerator):
             stage_debug=stage_debug,
         )
 
-    def _find_action_chunk_value(self, sample: Mapping[str, Any]) -> tuple[Any | None, str | None]:
-        """Find the first configured action-target-chunk field present in the sample."""
-        for key in self.cfg.action_chunk_key_candidates:
+    def _find_action_value(self, sample: Mapping[str, Any]) -> tuple[Any | None, str | None]:
+        """Find the first configured single-step action field present in the sample."""
+        for key in self.cfg.action_key_candidates:
             value = lookup_sample_value(key, sample)
             if value is not None:
                 return value, key

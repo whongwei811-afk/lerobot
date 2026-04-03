@@ -34,12 +34,11 @@ class StageLabelOutput:
 
     - Hard labels typically use `stage_id`.
     - Soft labels typically use `stage_prob_target`.
-    - Pseudo labels can use either or both depending on the algorithm.
 
     Attributes:
         stage_id: Optional discrete stage label tensor. This is typically an integer
-            tensor with shape like `(...)` or `(..., num_steps)` depending on the
-            granularity of stage supervision.
+            tensor with shape like `(...)` depending on the granularity of stage
+            supervision.
         stage_prob_target: Optional probabilistic stage target tensor. This is
             typically a float tensor containing per-stage probabilities or soft targets
             with a shape like `(..., num_stages)`.
@@ -47,7 +46,7 @@ class StageLabelOutput:
             and should contribute to loss or metrics. This field is always present so
             downstream code can gate supervision without inspecting the label source.
         stage_source: String identifier describing where the stage labels came from,
-            such as `"hard"`, `"pseudo"`, `"soft"`, or `"none"`.
+            such as `"hard"`, `"soft"`, or `"none"`.
         stage_debug: Auxiliary debug metadata for logging or inspection. Keep values
             small and preferably collate-friendly when this structure is used before a
             dataloader collation step.
@@ -57,8 +56,7 @@ class StageLabelOutput:
         default=None,
         metadata={
             "doc": (
-                "Optional discrete stage label tensor used by hard-label or pseudo-label "
-                "supervision."
+                "Optional discrete stage label tensor used by hard-label supervision."
             )
         },
     )
@@ -189,8 +187,8 @@ class BaseStageLabelGenerator(abc.ABC):
 
     Concrete generators should implement `generate()` and return the same
     `StageLabelOutput` schema regardless of how labels are produced. This keeps
-    downstream components decoupled from the label source and allows hard, pseudo,
-    and soft label generation strategies to be swapped without changing model-facing
+    downstream components decoupled from the label source and allows hard and
+    soft label generation strategies to be swapped without changing model-facing
     code.
     """
 

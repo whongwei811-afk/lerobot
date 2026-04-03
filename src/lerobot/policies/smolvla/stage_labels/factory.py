@@ -19,13 +19,11 @@ from __future__ import annotations
 from typing import Any
 
 from .base import BaseStageLabelGenerator
-from .future_chunk_pseudo_generator import FutureChunkPseudoLabelGenerator
 from .hard_label_generator import HardStageLabelGenerator
 from .soft_label_generator import SoftStageLabelGenerator
 
 SUPPORTED_STAGE_LABEL_GENERATOR_MODES: tuple[str, ...] = (
     "hard",
-    "future_pseudo",
     "soft",
 )
 
@@ -41,8 +39,7 @@ def build_stage_label_generator(
     and instantiates the appropriate stage-label generator implementation.
 
     Args:
-        mode: Label generator mode. Supported values are `"hard"`,
-            `"future_pseudo"`, and `"soft"`.
+        mode: Label generator mode. Supported values are `"hard"` and `"soft"`.
         cfg: Optional config object, mapping, or dataclass instance passed to the
             selected generator constructor.
         **kwargs: Optional keyword arguments forwarded to the generator
@@ -79,8 +76,6 @@ def build_stage_label_generator(
 
     if normalized_mode == "hard":
         return HardStageLabelGenerator(cfg=cfg, **kwargs)
-    if normalized_mode == "future_pseudo":
-        return FutureChunkPseudoLabelGenerator(cfg=cfg, **kwargs)
     if normalized_mode == "soft":
         return SoftStageLabelGenerator(cfg=cfg, **kwargs)
 

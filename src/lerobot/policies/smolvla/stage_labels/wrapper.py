@@ -26,7 +26,7 @@ from .base import BaseStageLabelGenerator, StageLabelOutput
 
 
 class StageLabeledDataset(torch.utils.data.Dataset):
-    """Dataset wrapper that attaches stage labels to each returned sample.
+    """Dataset wrapper that attaches action-based stage labels to each sample.
 
     This wrapper leaves the underlying dataset unchanged on disk and does not
     modify the base sample in place. Instead, it creates a shallow top-level copy
@@ -171,7 +171,7 @@ class StageLabeledDataset(torch.utils.data.Dataset):
         For generators that return probabilities (soft label):
             Returns the probability vector directly.
 
-        For generators without probabilities (hard/pseudo label):
+        For generators without probabilities (hard label):
             Returns a zero vector of shape (K,). The stage_valid_mask indicates
             whether this label should contribute to loss.
 

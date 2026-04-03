@@ -49,7 +49,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _run_smoke_test() -> None:
+def _run_smoke_test(mode: str) -> None:
     dataset_root = Path(ROOT_ENV).expanduser() if ROOT_ENV else None
 
     raw_dataset = LeRobotDataset(
@@ -58,9 +58,10 @@ def _run_smoke_test() -> None:
         episodes=[EPISODE],
         download_videos=False,
     )
-    generator = build_stage_label_generator("hard")
+    generator = build_stage_label_generator(mode)
     stage_labeled_dataset = StageLabeledDataset(raw_dataset, generator, include_debug=True)
 
+    print("mode =", mode)
     print("raw_dataset =", raw_dataset)
     print("stage_labeled_dataset =", stage_labeled_dataset)
     print("len(raw_dataset) =", len(raw_dataset))
@@ -85,13 +86,22 @@ def _run_smoke_test() -> None:
         assert isinstance(sample["stage_valid_mask"], torch.Tensor)
         assert isinstance(sample["stage_source"], str)
         assert isinstance(sample["stage_debug"], dict)
+        assert sample["stage_source"] == mode
+        assert sample["stage_debug"].get("action_semantics") == "single_step_action"
+        if mode == "soft":
+            assert (
+                sample["stage_debug"].get("decision_reason")
+                != "insufficient_action_target_chunk_length"
+            )
 
     assert len(stage_labeled_dataset) == len(raw_dataset)
 
 
-def test_raw_libero_dataset_can_be_converted_to_stage_labeled_dataset() -> None:
-    _run_smoke_test()
+@pytest.mark.parametrize("mode", ["hard", "soft"])
+def test_raw_libero_dataset_can_be_converted_to_stage_labeled_dataset(mode: str) -> None:
+    _run_smoke_test(mode)
 
 
 if __name__ == "__main__":
-    _run_smoke_test()
+    _run_smoke_test("hard")
+    _run_smoke_test("soft")
