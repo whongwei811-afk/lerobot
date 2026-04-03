@@ -137,7 +137,7 @@ def extract_action_chunk_tensor(value: Any | None) -> torch.Tensor | None:
     Legacy note:
         This helper remains only for legacy/internal chunk-based code paths.
         Current public hard/soft stage-label generators use
-        `extract_single_action_tensor_with_reason(...)` instead.
+        `extract_action_chunk_with_reason(...)` instead.
 
     The behavior matches the current hard-label generator:
     - `(D,)` becomes `(1, D)`
@@ -161,6 +161,84 @@ def extract_action_chunk_tensor(value: Any | None) -> torch.Tensor | None:
     if tensor.ndim >= 2:
         return tensor.reshape(-1, tensor.shape[-1])
     return None
+
+
+def extract_action_chunk_with_reason(
+    value: Any | None,
+    min_steps: int = 2,
+) -> tuple[torch.Tensor | None, str | None, dict[str, Any]]:
+    """Convert an action-like value into a local action chunk tensor of shape `(K, D)`.
+
+    The chunk semantics are explicit:
+    - arm energy is later computed from `delta_action_chunk = action_chunk[1:] - action_chunk[:-1]`
+    - gripper signal is primarily derived from event detection over the chunk
+
+    Args:
+        value: Action-chunk-like content from a sample.
+        min_steps: Minimum required number of chunk steps.
+
+    Returns:
+        A tuple `(action_chunk, reason, debug)` where `action_chunk` is a detached
+        `(K, D)` tensor on success. Invalid cases return `None` with one of:
+        - `"missing_action_chunk"`
+        - `"invalid_action_chunk_shape"`
+        - `"insufficient_action_chunk_length"`
+    """
+    if value is None:
+        return None, "missing_action_chunk", {}
+
+    tensor = coerce_to_tensor(value)
+    if tensor is None:
+        return None, "missing_action_chunk", {"action_chunk_value_type": type(value).__name__}
+
+    tensor = tensor.detach()
+    if tensor.ndim != 2:
+        return None, "invalid_action_chunk_shape", {"action_chunk_shape": tuple(tensor.shape)}
+
+    chunk_length = int(tensor.shape[0])
+    if chunk_length < min_steps:
+        return None, "insufficient_action_chunk_length", {"chunk_length": chunk_length}
+
+    return tensor, None, {}
+
+
+def extract_state_chunk_tensor(
+    value: Any | None,
+    min_steps: int = 2,
+) -> tuple[torch.Tensor | None, str | None, dict[str, Any]]:
+    """Convert a state-like value into a local state chunk tensor of shape `(K, S)`.
+
+    This helper is dedicated to chunk-based gripper event extraction. Unlike the
+    legacy action-chunk helper, it does not reinterpret 1D inputs as a valid
+    chunk because state-event detection requires an explicit sequence.
+
+    Args:
+        value: State-chunk-like content from a sample.
+        min_steps: Minimum required number of chunk steps.
+
+    Returns:
+        A tuple `(state_chunk, reason, debug)` where `state_chunk` is a detached
+        `(K, S)` tensor on success. Invalid cases return `None` with one of:
+        - `"missing_state_chunk"`
+        - `"invalid_state_chunk_shape"`
+        - `"insufficient_state_chunk_length"`
+    """
+    if value is None:
+        return None, "missing_state_chunk", {}
+
+    tensor = coerce_to_tensor(value)
+    if tensor is None:
+        return None, "missing_state_chunk", {"state_chunk_value_type": type(value).__name__}
+
+    tensor = tensor.detach()
+    if tensor.ndim != 2:
+        return None, "invalid_state_chunk_shape", {"state_chunk_shape": tuple(tensor.shape)}
+
+    chunk_length = int(tensor.shape[0])
+    if chunk_length < min_steps:
+        return None, "insufficient_state_chunk_length", {"chunk_length": chunk_length}
+
+    return tensor, None, {}
 
 
 def extract_single_action_tensor_with_reason(
@@ -323,3 +401,131 @@ def compute_mean_abs_signal(action_vector: torch.Tensor, indices: Sequence[int])
             f"`action_vector` must have shape (D,), got {tuple(action_vector.shape)}."
         )
     return float(action_vector[list(indices)].abs().mean().item())
+
+
+def compute_mean_abs_chunk_delta(
+    action_chunk: torch.Tensor,
+    indices: Sequence[int],
+) -> float:
+    """Compute mean absolute delta over selected dimensions of a local action chunk."""
+    if not indices:
+        return 0.0
+    if action_chunk.ndim != 2 or action_chunk.shape[0] < 2:
+        raise ValueError(
+            f"`action_chunk` must have shape (K, D) with K >= 2, got {tuple(action_chunk.shape)}."
+        )
+    delta_chunk = action_chunk[1:] - action_chunk[:-1]
+    return float(delta_chunk[:, list(indices)].abs().mean().item())
+
+
+def compute_mean_signed_chunk_delta(
+    action_chunk: torch.Tensor,
+    indices: Sequence[int],
+) -> float:
+    """Compute mean signed delta over selected dimensions of a local action chunk."""
+    if not indices:
+        return 0.0
+    if action_chunk.ndim != 2 or action_chunk.shape[0] < 2:
+        raise ValueError(
+            f"`action_chunk` must have shape (K, D) with K >= 2, got {tuple(action_chunk.shape)}."
+        )
+    delta_chunk = action_chunk[1:] - action_chunk[:-1]
+    return float(delta_chunk[:, list(indices)].mean().item())
+
+
+def extract_binary_gripper_events_from_state_chunk(
+    state_chunk: torch.Tensor,
+    gripper_state_indices: Sequence[int],
+    *,
+    closed_threshold: float | None = None,
+    open_threshold: float | None = None,
+    is_binary_state: bool = True,
+) -> tuple[dict[str, Any], str | None, dict[str, Any]]:
+    """Extract binary gripper open/close events from a state chunk.
+
+    The returned event dict is designed for event-driven stage labeling where
+    the gripper signal is primarily discrete, while arm motion remains
+    delta-action-chunk energy driven.
+    """
+    if state_chunk.ndim != 2:
+        return {}, "invalid_state_chunk_shape", {"state_chunk_shape": tuple(state_chunk.shape)}
+
+    if not gripper_state_indices:
+        return {}, None, {}
+
+    values = state_chunk[:, list(gripper_state_indices)].float().mean(dim=1)
+    if values.numel() < 2:
+        return {}, "insufficient_state_chunk_length", {"chunk_length": int(values.numel())}
+
+    if is_binary_state:
+        states = values > 0
+    else:
+        if closed_threshold is None or open_threshold is None:
+            return (
+                {},
+                "missing_gripper_state_thresholds",
+                {
+                    "closed_threshold": closed_threshold,
+                    "open_threshold": open_threshold,
+                },
+            )
+        start_value = float(values[0].item())
+        end_value = float(values[-1].item())
+        if start_value >= closed_threshold:
+            start_state = True
+        elif start_value <= open_threshold:
+            start_state = False
+        else:
+            start_state = start_value > (closed_threshold + open_threshold) / 2.0
+        if end_value >= closed_threshold:
+            end_state = True
+        elif end_value <= open_threshold:
+            end_state = False
+        else:
+            end_state = end_value > (closed_threshold + open_threshold) / 2.0
+        states = torch.tensor([start_state, end_state], dtype=torch.bool, device=values.device)
+
+    start_state = bool(states[0].item())
+    end_state = bool(states[-1].item())
+    changed = start_state != end_state
+    return (
+        {
+            "gripper_start_state": start_state,
+            "gripper_end_state": end_state,
+            "gripper_changed": changed,
+            "closing_event": (not start_state) and end_state,
+            "opening_event": start_state and (not end_state),
+        },
+        None,
+        {},
+    )
+
+
+def extract_gripper_events_from_action_chunk(
+    action_chunk: torch.Tensor,
+    gripper_action_indices: Sequence[int],
+    *,
+    close_is_negative: bool,
+    trend_threshold: float,
+) -> dict[str, Any]:
+    """Extract auxiliary gripper trend scores from a local action chunk."""
+    if not gripper_action_indices:
+        return {
+            "gripper_signed_trend": 0.0,
+            "close_command_score": 0.0,
+            "open_command_score": 0.0,
+        }
+
+    gripper_signed_trend = compute_mean_signed_chunk_delta(action_chunk, gripper_action_indices)
+    if close_is_negative:
+        close_command_score = max(0.0, -gripper_signed_trend - trend_threshold)
+        open_command_score = max(0.0, gripper_signed_trend - trend_threshold)
+    else:
+        close_command_score = max(0.0, gripper_signed_trend - trend_threshold)
+        open_command_score = max(0.0, -gripper_signed_trend - trend_threshold)
+
+    return {
+        "gripper_signed_trend": gripper_signed_trend,
+        "close_command_score": close_command_score,
+        "open_command_score": open_command_score,
+    }

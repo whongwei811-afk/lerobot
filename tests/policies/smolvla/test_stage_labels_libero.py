@@ -87,12 +87,7 @@ def _run_smoke_test(mode: str) -> None:
         assert isinstance(sample["stage_source"], str)
         assert isinstance(sample["stage_debug"], dict)
         assert sample["stage_source"] == mode
-        assert sample["stage_debug"].get("action_semantics") == "single_step_action"
-        if mode == "soft":
-            assert (
-                sample["stage_debug"].get("decision_reason")
-                != "insufficient_action_target_chunk_length"
-            )
+        assert sample["stage_debug"].get("action_semantics") == "local_action_chunk"
 
     assert len(stage_labeled_dataset) == len(raw_dataset)
 

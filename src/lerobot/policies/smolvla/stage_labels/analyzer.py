@@ -53,6 +53,10 @@ class StageLabelStatistics:
     - Soft label statistics (probability distributions)
     - Invalid reason statistics
     - Device consistency checks
+
+    For chunk-based stage labels, energy-related debug values refer to arm
+    delta-action-chunk energy, while gripper semantics are primarily driven by
+    event signals rather than continuous gripper energy.
     """
 
     def __init__(
@@ -101,7 +105,7 @@ class StageLabelStatistics:
         # Source type distribution
         self.source_counts = Counter()
 
-        # Per-stage energy statistics (if available in debug)
+        # Per-stage arm-energy / gripper-event statistics (if available in debug)
         self.stage_energy_stats = defaultdict(list)
 
     def compute(self) -> None:
@@ -182,7 +186,7 @@ class StageLabelStatistics:
                 self.soft_label_max_probs.append(float(np.max(prob_np)))
                 self.soft_label_entropy_values.append(self._compute_entropy(prob_np))
 
-            # Collect energy statistics if available
+            # Collect arm delta-action-chunk energy statistics if available
             if "large_joint_energy" in stage_debug:
                 self.stage_energy_stats["large_joint_energy"].append(
                     float(stage_debug.get("large_joint_energy", 0.0))
@@ -190,8 +194,13 @@ class StageLabelStatistics:
                 self.stage_energy_stats["small_joint_energy"].append(
                     float(stage_debug.get("small_joint_energy", 0.0))
                 )
-                self.stage_energy_stats["gripper_energy"].append(
-                    float(stage_debug.get("gripper_energy", 0.0))
+            if "closing_event_strength" in stage_debug:
+                self.stage_energy_stats["closing_event_strength"].append(
+                    float(stage_debug.get("closing_event_strength", 0.0))
+                )
+            if "opening_event_strength" in stage_debug:
+                self.stage_energy_stats["opening_event_strength"].append(
+                    float(stage_debug.get("opening_event_strength", 0.0))
                 )
 
         else:
@@ -347,10 +356,15 @@ class StageLabelStatistics:
                 pct = 100 * count / total_invalid
                 lines.append(f"  {reason}: {count} ({pct:.1f}%)")
 
-        # Energy statistics
+        # Arm delta-action-chunk energy / gripper event statistics
         if self.stage_energy_stats:
-            lines.append(f"\nEnergy statistics (from debug data):")
-            for energy_type in ["large_joint_energy", "small_joint_energy", "gripper_energy"]:
+            lines.append(f"\nEnergy statistics (arm delta-action-chunk / gripper event debug data):")
+            for energy_type in [
+                "large_joint_energy",
+                "small_joint_energy",
+                "closing_event_strength",
+                "opening_event_strength",
+            ]:
                 if energy_type in self.stage_energy_stats:
                     values = np.array(self.stage_energy_stats[energy_type])
                     lines.append(f"  {energy_type}:")

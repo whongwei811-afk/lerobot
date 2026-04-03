@@ -22,15 +22,19 @@ from typing import Any
 import torch
 import torch.utils.data
 
+from lerobot.utils.constants import ACTION, OBS_STATE
+
 from .base import BaseStageLabelGenerator, StageLabelOutput
+from .utils import extract_latest_state_tensor, extract_single_action_tensor_with_reason
 
 
 class StageLabeledDataset(torch.utils.data.Dataset):
-    """Dataset wrapper that attaches action-based stage labels to each sample.
+    """Dataset wrapper that attaches chunk-based stage labels to each sample.
 
     This wrapper leaves the underlying dataset unchanged on disk and does not
     modify the base sample in place. Instead, it creates a shallow top-level copy
-    of each retrieved sample, runs a stage-label generator on the original sample,
+    of each retrieved sample, injects a local current-to-future action chunk,
+    runs a stage-label generator on the enriched sample,
     and appends the normalized stage-label fields to the copied sample.
 
     By default, debug metadata is excluded from training samples because debug
@@ -57,6 +61,8 @@ class StageLabeledDataset(torch.utils.data.Dataset):
         label_generator: BaseStageLabelGenerator,
         include_debug: bool = False,
         default_num_stages: int = 3,
+        action_chunk_size: int = 8,
+        action_chunk_anchor: str = "current_to_future",
     ) -> None:
         """Initialize a stage-labeled dataset wrapper.
 
@@ -69,10 +75,25 @@ class StageLabeledDataset(torch.utils.data.Dataset):
                 Defaults to `False`.
             default_num_stages: Default number of stages when inference fails.
                 Defaults to 3 (move, grasp, place).
+            action_chunk_size: Number of consecutive frames used to build the
+                local action chunk anchored at the current sample. Must be >= 2.
+            action_chunk_anchor: Chunk anchor mode. Only
+                `"current_to_future"` is currently supported.
         """
+        if action_chunk_size < 2:
+            raise ValueError(
+                f"`action_chunk_size` must be >= 2, got {action_chunk_size}."
+            )
+        if action_chunk_anchor != "current_to_future":
+            raise ValueError(
+                "`action_chunk_anchor` only supports 'current_to_future'. "
+                f"Got {action_chunk_anchor!r}."
+            )
         self.base_dataset = base_dataset
         self.label_generator = label_generator
         self.include_debug = include_debug
+        self.action_chunk_size = action_chunk_size
+        self.action_chunk_anchor = action_chunk_anchor
         self.num_stages = self._infer_num_stages(label_generator)
         if self.num_stages == 0:
             self.num_stages = default_num_stages
@@ -87,8 +108,9 @@ class StageLabeledDataset(torch.utils.data.Dataset):
         Workflow:
         1. Read the base sample from `base_dataset[idx]`.
         2. Create a top-level copy so the original sample is not modified in place.
-        3. Run the stage-label generator on the original sample.
-        4. Attach normalized stage-label fields to the copied sample.
+        3. Inject local action/state chunk context anchored at `idx`.
+        4. Run the stage-label generator on the enriched sample.
+        5. Attach normalized stage-label fields to the copied sample.
 
         Args:
             idx: Sample index.
@@ -107,7 +129,8 @@ class StageLabeledDataset(torch.utils.data.Dataset):
             )
 
         labeled_sample = dict(base_sample)
-        stage_output = self.label_generator(base_sample)
+        self._inject_local_action_chunk(sample=labeled_sample, idx=idx)
+        stage_output = self.label_generator(labeled_sample)
         self._attach_stage_fields(labeled_sample, stage_output)
 
         if self.include_debug:
@@ -125,8 +148,90 @@ class StageLabeledDataset(torch.utils.data.Dataset):
             f"{self.__class__.__name__}("
             f"base_dataset={self.base_dataset!r}, "
             f"label_generator={self.label_generator.__class__.__name__}, "
-            f"include_debug={self.include_debug})"
+            f"include_debug={self.include_debug}, "
+            f"action_chunk_size={self.action_chunk_size}, "
+            f"action_chunk_anchor={self.action_chunk_anchor!r})"
         )
+
+    def _inject_local_action_chunk(self, sample: dict[str, Any], idx: int) -> None:
+        """Attach local chunk metadata used by chunk-based stage-label generators.
+
+        Semantics:
+        - `stage_label_chunk_complete`: actual chunk length equals requested length
+        - `stage_label_chunk_valid`: structurally usable chunk, meaning:
+          not cross-episode, action chunk exists, and chunk length is at least 2
+
+        A chunk can therefore be valid but incomplete, which is expected near an
+        episode tail or dataset boundary.
+        """
+        episode_index = sample.get("episode_index")
+        action_rows: list[torch.Tensor] = []
+        state_rows: list[torch.Tensor] = []
+        state_chunk_available = True
+        cross_episode = False
+
+        for offset in range(self.action_chunk_size):
+            current_idx = idx + offset
+            if current_idx >= len(self.base_dataset):
+                break
+
+            chunk_sample = self.base_dataset[current_idx]
+            if not isinstance(chunk_sample, Mapping):
+                raise TypeError(
+                    "StageLabeledDataset expects chunk samples to be mapping-like. "
+                    f"Got {type(chunk_sample).__name__} at index {current_idx}."
+                )
+
+            if offset > 0 and episode_index is not None and chunk_sample.get("episode_index") != episode_index:
+                cross_episode = True
+                break
+
+            action_value = self._lookup_chunk_value(ACTION, "actions", sample=chunk_sample)
+            action_row, _, _ = extract_single_action_tensor_with_reason(action_value)
+            if action_row is None:
+                break
+            action_rows.append(action_row)
+
+            if state_chunk_available:
+                state_value = self._lookup_chunk_value(OBS_STATE, "observation.state", sample=chunk_sample)
+                state_row = extract_latest_state_tensor(state_value)
+                if state_row is None:
+                    state_chunk_available = False
+                    state_rows.clear()
+                else:
+                    state_rows.append(state_row)
+
+        chunk_size = len(action_rows)
+        chunk_complete = chunk_size == self.action_chunk_size
+        chunk_valid = (not cross_episode) and chunk_size >= 2
+        sample["stage_label_chunk_valid"] = chunk_valid
+        sample["stage_label_chunk_size"] = chunk_size
+        sample["stage_label_chunk_requested_size"] = self.action_chunk_size
+        sample["stage_label_chunk_cross_episode"] = cross_episode
+        sample["stage_label_chunk_complete"] = chunk_complete
+        sample["stage_label_anchor_index"] = idx
+
+        if action_rows:
+            sample["stage_label_action_chunk"] = torch.stack(action_rows, dim=0)
+        if state_rows and len(state_rows) == len(action_rows):
+            sample["stage_label_state_chunk"] = torch.stack(state_rows, dim=0)
+
+    @staticmethod
+    def _lookup_chunk_value(*keys: str, sample: Mapping[str, Any]) -> Any | None:
+        """Return the first available chunk source among candidate keys."""
+        for key in keys:
+            if key in sample:
+                return sample[key]
+            current: Any = sample
+            found = True
+            for part in key.split("."):
+                if not isinstance(current, Mapping) or part not in current:
+                    found = False
+                    break
+                current = current[part]
+            if found:
+                return current
+        return None
 
     def _attach_stage_fields(
         self,
