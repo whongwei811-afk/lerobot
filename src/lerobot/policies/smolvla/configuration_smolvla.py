@@ -106,6 +106,12 @@ class SmolVLAConfig(PreTrainedConfig):
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
 
+    # Optional stage-label lookup during training.
+    use_stage_labels: bool = False
+    stage_label_path: str | None = None
+    stage_label_fallback_probs: tuple[float, float] = (0.5, 0.5)
+    stage_label_cache_in_memory: bool = True
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -119,6 +125,24 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+
+        if len(self.stage_label_fallback_probs) != 2:
+            raise ValueError(
+                "`stage_label_fallback_probs` must contain exactly 2 entries, got "
+                f"{len(self.stage_label_fallback_probs)}."
+            )
+
+        fallback_sum = sum(self.stage_label_fallback_probs)
+        if fallback_sum <= 0.0:
+            raise ValueError(
+                "`stage_label_fallback_probs` must sum to a positive value so it can represent a valid mixture."
+            )
+        if any(prob < 0.0 for prob in self.stage_label_fallback_probs):
+            raise ValueError("`stage_label_fallback_probs` must be non-negative.")
+
+        self.stage_label_fallback_probs = tuple(
+            prob / fallback_sum for prob in self.stage_label_fallback_probs
+        )
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

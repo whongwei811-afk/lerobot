@@ -69,6 +69,7 @@ from ..utils import (
     populate_queues,
 )
 from .configuration_smolvla import SmolVLAConfig
+from .stage_label_provider import StageLabelProvider
 from .smolvlm_with_expert import SmolVLMWithExpertModel
 
 
@@ -242,6 +243,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
+        self._stage_label_provider: StageLabelProvider | None = None
         self.init_rtc_processor()
         self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
         self.reset()
@@ -353,6 +355,37 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
+    def _get_stage_label_provider(self) -> StageLabelProvider:
+        if not self.config.use_stage_labels:
+            raise RuntimeError("Stage-label provider is only available when `use_stage_labels=True`.")
+
+        if self.config.stage_label_path is None or self.config.stage_label_path.strip() == "":
+            raise ValueError(
+                "`use_stage_labels=True` requires `stage_label_path` to point to a valid parquet file."
+            )
+
+        if self._stage_label_provider is None:
+            self._stage_label_provider = StageLabelProvider(
+                stage_label_path=self.config.stage_label_path,
+                fallback_probs=self.config.stage_label_fallback_probs,
+                cache_in_memory=self.config.stage_label_cache_in_memory,
+            )
+        return self._stage_label_provider
+
+    def _maybe_get_batch_stage_probs(
+        self, batch: dict[str, Tensor], device: torch.device
+    ) -> Tensor | None:
+        if not self.config.use_stage_labels:
+            return None
+
+        if "index" not in batch:
+            raise KeyError(
+                "`use_stage_labels=True` requires `batch['index']` so SmolVLA can look up stage soft labels."
+            )
+
+        provider = self._get_stage_label_provider()
+        return provider.get_batch_stage_probs(batch["index"]).to(device=device, dtype=torch.float32)
+
     def forward(
         self, batch: dict[str, Tensor], noise=None, time=None, reduction: str = "mean"
     ) -> dict[str, Tensor]:
@@ -375,8 +408,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
+        stage_label_probs = self._maybe_get_batch_stage_probs(batch, device=actions.device)
         actions_is_pad = batch.get("action_is_pad")
         loss_dict = {}
+        if stage_label_probs is not None:
+            # Keep stage labels local to the policy forward pass for future stage-aware losses.
+            loss_dict["stage_probs_mean_global"] = stage_label_probs[:, 0].mean().item()
+            loss_dict["stage_probs_mean_local"] = stage_label_probs[:, 1].mean().item()
         losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
