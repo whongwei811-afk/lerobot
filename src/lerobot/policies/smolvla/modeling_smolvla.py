@@ -79,6 +79,12 @@ class ActionSelectKwargs(TypedDict, total=False):
     execution_horizon: int | None
 
 
+class StageHeadOutput(TypedDict, total=False):
+    stage_context: Tensor
+    stage_logits: Tensor
+    stage_probs: Tensor
+
+
 def create_sinusoidal_pos_embedding(
     time: torch.tensor, dimension: int, min_period: float, max_period: float, device="cpu"
 ) -> Tensor:
@@ -169,6 +175,12 @@ def pad_vector(vector, new_dim):
     return new_vector
 
 
+def soft_target_cross_entropy(logits: Tensor, target_probs: Tensor) -> Tensor:
+    """Compute cross-entropy against soft targets and return per-sample losses."""
+    log_probs = F.log_softmax(logits, dim=-1)
+    return -(target_probs * log_probs).sum(dim=-1)
+
+
 def normalize(x, min_val, max_val):
     return (x - min_val) / (max_val - min_val)
 
@@ -223,6 +235,21 @@ def aloha_gripper_from_angular_inv(value):
     return normalize(value, min_val=0.4, max_val=1.5)
 
 
+class StageHead(nn.Module):
+    """Small MLP that predicts the chunk-level stage distribution."""
+
+    def __init__(self, input_dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 2),
+        )
+
+    def forward(self, hidden_state: Tensor) -> Tensor:
+        return self.mlp(hidden_state)
+
+
 class SmolVLAPolicy(PreTrainedPolicy):
     """Wrapper class around VLAFlowMatching model to train and run inference within LeRobot."""
 
@@ -244,6 +271,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
         self._stage_label_provider: StageLabelProvider | None = None
+        self._last_stage_head_output: dict[str, Tensor | None] | None = None
         self.init_rtc_processor()
         self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
         self.reset()
@@ -386,9 +414,42 @@ class SmolVLAPolicy(PreTrainedPolicy):
         provider = self._get_stage_label_provider()
         return provider.get_batch_stage_probs(batch["index"]).to(device=device, dtype=torch.float32)
 
+    @property
+    def last_stage_head_output(self) -> dict[str, Tensor | None] | None:
+        return self._last_stage_head_output
+
+    def _cache_stage_head_output(
+        self,
+        stage_outputs: StageHeadOutput | None,
+        stage_label_probs: Tensor | None,
+        stage_loss_per_sample: Tensor | None,
+    ) -> None:
+        if stage_outputs is None and stage_label_probs is None and stage_loss_per_sample is None:
+            self._last_stage_head_output = None
+            return
+
+        cached_outputs: dict[str, Tensor | None] = {
+            "stage_logits": None,
+            "stage_probs": None,
+            "stage_context": None,
+            "stage_label_probs": None,
+            "stage_loss": None,
+            "stage_loss_per_sample": None,
+        }
+        if stage_outputs is not None:
+            cached_outputs["stage_logits"] = stage_outputs["stage_logits"].detach()
+            cached_outputs["stage_probs"] = stage_outputs["stage_probs"].detach()
+            cached_outputs["stage_context"] = stage_outputs["stage_context"].detach()
+        if stage_label_probs is not None:
+            cached_outputs["stage_label_probs"] = stage_label_probs.detach()
+        if stage_loss_per_sample is not None:
+            cached_outputs["stage_loss_per_sample"] = stage_loss_per_sample.detach()
+            cached_outputs["stage_loss"] = stage_loss_per_sample.mean().detach()
+        self._last_stage_head_output = cached_outputs
+
     def forward(
         self, batch: dict[str, Tensor], noise=None, time=None, reduction: str = "mean"
-    ) -> dict[str, Tensor]:
+    ) -> tuple[Tensor, dict]:
         """Do a full training forward pass to compute the loss.
 
         Args:
@@ -415,7 +476,25 @@ class SmolVLAPolicy(PreTrainedPolicy):
             # Keep stage labels local to the policy forward pass for future stage-aware losses.
             loss_dict["stage_probs_mean_global"] = stage_label_probs[:, 0].mean().item()
             loss_dict["stage_probs_mean_local"] = stage_label_probs[:, 1].mean().item()
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        losses, stage_outputs = self.model.forward(
+            images, img_masks, lang_tokens, lang_masks, state, actions, noise, time
+        )
+        stage_loss_per_sample = None
+        if stage_outputs is not None:
+            stage_probs = stage_outputs["stage_probs"]
+            loss_dict["stage_head_probs_mean_global"] = stage_probs[:, 0].mean().item()
+            loss_dict["stage_head_probs_mean_local"] = stage_probs[:, 1].mean().item()
+            if stage_label_probs is not None:
+                stage_loss_per_sample = soft_target_cross_entropy(
+                    stage_outputs["stage_logits"], stage_label_probs
+                )
+                loss_dict["stage_loss"] = stage_loss_per_sample.mean().item()
+                loss_dict["stage_loss_weighted"] = (
+                    self.config.stage_loss_weight * stage_loss_per_sample.mean().item()
+                )
+            else:
+                loss_dict["stage_loss"] = 0.0
+        self._cache_stage_head_output(stage_outputs, stage_label_probs, stage_loss_per_sample)
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
@@ -428,15 +507,20 @@ class SmolVLAPolicy(PreTrainedPolicy):
         # Remove padding
         losses = losses[:, :, : self.config.max_action_dim]
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
+        action_loss_per_sample = losses.mean(dim=(1, 2))
+        if stage_loss_per_sample is not None:
+            total_loss_per_sample = (
+                action_loss_per_sample + self.config.stage_loss_weight * stage_loss_per_sample
+            )
+        else:
+            total_loss_per_sample = action_loss_per_sample
+        loss_dict["action_loss"] = action_loss_per_sample.mean().item()
 
         if reduction == "none":
-            # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
-            loss_dict["loss"] = per_sample_loss.mean().item()
-            return per_sample_loss, loss_dict
+            loss_dict["loss"] = total_loss_per_sample.mean().item()
+            return total_loss_per_sample, loss_dict
         else:
-            # Default: return scalar mean loss
-            loss = losses.mean()
+            loss = total_loss_per_sample.mean()
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
@@ -620,6 +704,12 @@ class VLAFlowMatching(nn.Module):
         self.action_time_mlp_out = nn.Linear(
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
+        self.stage_head = None
+        if self.config.use_stage_head:
+            self.stage_head = StageHead(
+                self.vlm_with_expert.config.text_config.hidden_size,
+                self.config.stage_head_hidden_dim,
+            )
 
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
@@ -799,9 +889,42 @@ class VLAFlowMatching(nn.Module):
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
         return embs, pad_masks, att_masks
 
+    def pool_stage_context(self, prefix_hidden_states: Tensor, prefix_pad_masks: Tensor) -> Tensor:
+        """Pool prefix hidden states into a single representation for stage prediction."""
+        if self.config.stage_pooling == "last_state_token":
+            # State tokens are appended at the end of the unpadded prefix sequence.
+            last_valid_indices = prefix_pad_masks.sum(dim=1).clamp_min(1).to(dtype=torch.long) - 1
+            batch_indices = torch.arange(prefix_hidden_states.shape[0], device=prefix_hidden_states.device)
+            return prefix_hidden_states[batch_indices, last_valid_indices]
+
+        if self.config.stage_pooling == "mean":
+            valid_mask = prefix_pad_masks.unsqueeze(-1).to(dtype=prefix_hidden_states.dtype)
+            valid_count = valid_mask.sum(dim=1).clamp_min(1.0)
+            return (prefix_hidden_states * valid_mask).sum(dim=1) / valid_count
+
+        raise ValueError(
+            f"Unsupported stage pooling '{self.config.stage_pooling}'. "
+            "Expected 'last_state_token' or 'mean'."
+        )
+
+    def predict_stage(
+        self, prefix_hidden_states: Tensor, prefix_pad_masks: Tensor
+    ) -> StageHeadOutput | None:
+        if not self.config.use_stage_head or self.stage_head is None:
+            return None
+
+        stage_context = self.pool_stage_context(prefix_hidden_states, prefix_pad_masks)
+        stage_logits = self.stage_head(stage_context).to(dtype=torch.float32)
+        stage_probs = torch.softmax(stage_logits, dim=-1)
+        return {
+            "stage_context": stage_context,
+            "stage_logits": stage_logits,
+            "stage_probs": stage_probs,
+        }
+
     def forward(
         self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
-    ) -> Tensor:
+    ) -> tuple[Tensor, StageHeadOutput | None]:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -822,7 +945,7 @@ class VLAFlowMatching(nn.Module):
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
+        (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
@@ -830,12 +953,13 @@ class VLAFlowMatching(nn.Module):
             use_cache=False,
             fill_kv_cache=False,
         )
+        stage_outputs = self.predict_stage(prefix_out, prefix_pad_masks)
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
-        return losses
+        return losses, stage_outputs
 
     def sample_actions(
         self,

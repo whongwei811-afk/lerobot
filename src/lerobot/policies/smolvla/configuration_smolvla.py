@@ -112,6 +112,12 @@ class SmolVLAConfig(PreTrainedConfig):
     stage_label_fallback_probs: tuple[float, float] = (0.5, 0.5)
     stage_label_cache_in_memory: bool = True
 
+    # Optional stage-head supervision on top of prefix hidden states.
+    use_stage_head: bool = False
+    stage_head_hidden_dim: int = 256
+    stage_loss_weight: float = 0.1
+    stage_pooling: str = "last_state_token"
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -143,6 +149,20 @@ class SmolVLAConfig(PreTrainedConfig):
         self.stage_label_fallback_probs = tuple(
             prob / fallback_sum for prob in self.stage_label_fallback_probs
         )
+
+        if self.stage_head_hidden_dim <= 0:
+            raise ValueError(
+                f"`stage_head_hidden_dim` must be positive, got {self.stage_head_hidden_dim}."
+            )
+        if self.stage_loss_weight < 0.0:
+            raise ValueError(
+                f"`stage_loss_weight` must be non-negative, got {self.stage_loss_weight}."
+            )
+        if self.stage_pooling not in {"last_state_token", "mean"}:
+            raise ValueError(
+                "`stage_pooling` must be one of {'last_state_token', 'mean'}, got "
+                f"'{self.stage_pooling}'."
+            )
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):
