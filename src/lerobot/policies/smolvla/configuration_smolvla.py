@@ -125,6 +125,13 @@ class SmolVLAConfig(PreTrainedConfig):
     use_multiscale_action_loss: bool = True
     action_large_scale_mode: str = "fixed_lowpass"
     action_large_scale_kernel: int = 5
+    use_alpha_schedule: bool = True
+    alpha_schedule: str = "linear"
+    alpha_start: float = 0.0
+    alpha_end: float = 1.0
+    alpha_warmup_steps: int = 10_000
+    alpha_hold_steps: int = 0
+    detach_pred_stage_for_action: bool = True
 
     def __post_init__(self):
         super().__post_init__()
@@ -187,6 +194,14 @@ class SmolVLAConfig(PreTrainedConfig):
         if self.action_large_scale_kernel <= 0:
             raise ValueError(
                 f"`action_large_scale_kernel` must be positive, got {self.action_large_scale_kernel}."
+            )
+        if self.alpha_schedule != "linear":
+            raise ValueError(
+                f"`alpha_schedule` only supports 'linear' in this stage, got '{self.alpha_schedule}'."
+            )
+        if self.alpha_hold_steps < 0:
+            raise ValueError(
+                f"`alpha_hold_steps` must be non-negative, got {self.alpha_hold_steps}."
             )
 
     def validate_features(self) -> None:

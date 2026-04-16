@@ -92,6 +92,7 @@ class ActionConditionedOutput(TypedDict, total=False):
     action_pred: Tensor
     action_target: Tensor
     z_cond: Tensor
+    alpha: Tensor
     l_large_elementwise: Tensor
     l_small_elementwise: Tensor
 
@@ -300,6 +301,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
+        self.register_buffer("num_updates", torch.zeros((), dtype=torch.long), persistent=False)
         self._stage_label_provider: StageLabelProvider | None = None
         self._last_stage_head_output: dict[str, Tensor | None] | None = None
         self.init_rtc_processor()
@@ -330,6 +332,42 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     def get_optim_params(self) -> dict:
         return self.parameters()
+
+    def update(self) -> None:
+        self.num_updates.add_(1)
+
+    def compute_alpha(self) -> float:
+        if not self.config.use_alpha_schedule:
+            return float(self.config.alpha_start)
+
+        if self.config.alpha_schedule != "linear":
+            raise ValueError(
+                f"`alpha_schedule` only supports 'linear' in this stage, got '{self.config.alpha_schedule}'."
+            )
+
+        if self.config.alpha_warmup_steps <= 0:
+            return float(self.config.alpha_end)
+
+        t = int(self.num_updates.item())
+        hold = self.config.alpha_hold_steps
+        warm = self.config.alpha_warmup_steps
+
+        if t < hold:
+            alpha = self.config.alpha_start
+        elif t >= hold + warm:
+            alpha = self.config.alpha_end
+        else:
+            progress = float(t - hold) / float(warm)
+            alpha = self.config.alpha_start + progress * (
+                self.config.alpha_end - self.config.alpha_start
+            )
+
+        alpha_min = min(self.config.alpha_start, self.config.alpha_end)
+        alpha_max = max(self.config.alpha_start, self.config.alpha_end)
+        return float(max(alpha_min, min(alpha, alpha_max)))
+
+    def blend_stage_condition(self, z: Tensor | None, z_hat: Tensor | None, alpha: float) -> Tensor | None:
+        return self.model.blend_stage_condition(z, z_hat, alpha)
 
     def _get_action_chunk(
         self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
@@ -475,6 +513,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             "stage_label_probs": None,
             "stage_loss": None,
             "stage_loss_per_sample": None,
+            "alpha": None,
             "z_cond": None,
             "action_hidden": None,
             "conditioned_action_hidden": None,
@@ -492,6 +531,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
             cached_outputs["stage_probs"] = stage_outputs["stage_probs"].detach()
             cached_outputs["stage_context"] = stage_outputs["stage_context"].detach()
         if model_outputs is not None:
+            if model_outputs.get("alpha") is not None:
+                cached_outputs["alpha"] = model_outputs["alpha"].detach()
             if model_outputs.get("z_cond") is not None:
                 cached_outputs["z_cond"] = model_outputs["z_cond"].detach()
             if model_outputs.get("action_hidden") is not None:
@@ -545,11 +586,19 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
         stage_label_probs = self._maybe_get_batch_stage_probs(batch, device=actions.device)
         actions_is_pad = batch.get("action_is_pad")
-        loss_dict = {}
+        alpha = self.compute_alpha()
+        loss_dict = {
+            "alpha": alpha,
+            "stage_agreement": math.nan,
+            "z_p_global_mean": math.nan,
+            "zhat_p_global_mean": math.nan,
+            "zcond_p_global_mean": math.nan,
+        }
         if stage_label_probs is not None:
             # Keep stage labels local to the policy forward pass for future stage-aware losses.
             loss_dict["stage_probs_mean_global"] = stage_label_probs[:, 0].mean().item()
             loss_dict["stage_probs_mean_local"] = stage_label_probs[:, 1].mean().item()
+            loss_dict["z_p_global_mean"] = stage_label_probs[:, 0].mean().item()
         losses, model_outputs = self.model.forward(
             images,
             img_masks,
@@ -560,6 +609,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             noise,
             time,
             stage_condition_probs=stage_label_probs,
+            alpha=alpha,
         )
         stage_outputs = model_outputs.get("stage_outputs") if model_outputs is not None else None
         stage_loss_per_sample = None
@@ -567,6 +617,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
             stage_probs = stage_outputs["stage_probs"]
             loss_dict["stage_head_probs_mean_global"] = stage_probs[:, 0].mean().item()
             loss_dict["stage_head_probs_mean_local"] = stage_probs[:, 1].mean().item()
+            loss_dict["zhat_p_global_mean"] = stage_probs[:, 0].mean().item()
+            if stage_label_probs is not None:
+                stage_agreement = (
+                    stage_label_probs.argmax(dim=-1) == stage_probs.argmax(dim=-1)
+                ).to(dtype=torch.float32)
+                loss_dict["stage_agreement"] = stage_agreement.mean().item()
             if stage_label_probs is not None:
                 stage_loss_per_sample = soft_target_cross_entropy(
                     stage_outputs["stage_logits"], stage_label_probs
@@ -591,6 +647,16 @@ class SmolVLAPolicy(PreTrainedPolicy):
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
         l_large_per_sample = None
         l_small_per_sample = None
+        z_cond_for_logging = None
+        if model_outputs is not None and model_outputs.get("z_cond") is not None:
+            z_cond_for_logging = model_outputs["z_cond"]
+        elif stage_label_probs is not None:
+            z_hat_for_logging = stage_outputs["stage_probs"] if stage_outputs is not None else None
+            z_cond_for_logging = self.blend_stage_condition(stage_label_probs, z_hat_for_logging, alpha)
+
+        if z_cond_for_logging is not None:
+            loss_dict["zcond_p_global_mean"] = z_cond_for_logging[:, 0].mean().item()
+
         if (
             self.config.use_stage_conditioned_action
             and self.config.use_multiscale_action_loss
@@ -640,10 +706,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
         loss_dict["total_loss"] = total_loss_per_sample.mean().item()
 
         if reduction == "none":
+            if self.training:
+                self.update()
             loss_dict["loss"] = total_loss_per_sample.mean().item()
             return total_loss_per_sample, loss_dict
         else:
             loss = total_loss_per_sample.mean()
+            if self.training:
+                self.update()
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
@@ -1056,6 +1126,20 @@ class VLAFlowMatching(nn.Module):
             "stage_probs": stage_probs,
         }
 
+    def blend_stage_condition(self, z: Tensor | None, z_hat: Tensor | None, alpha: float) -> Tensor | None:
+        if z is None:
+            return None
+
+        z = z.to(dtype=torch.float32)
+        if z_hat is None:
+            return z
+
+        z_hat_for_action = z_hat.detach() if self.config.detach_pred_stage_for_action else z_hat
+        z_hat_for_action = z_hat_for_action.to(device=z.device, dtype=z.dtype)
+        alpha_tensor = z.new_tensor(alpha)
+        z_cond = (1.0 - alpha_tensor) * z + alpha_tensor * z_hat_for_action
+        return z_cond
+
     def apply_stage_condition(
         self, action_hidden: Tensor, z_cond: Tensor | None
     ) -> tuple[Tensor, Tensor | None]:
@@ -1112,6 +1196,7 @@ class VLAFlowMatching(nn.Module):
         noise=None,
         time=None,
         stage_condition_probs: Tensor | None = None,
+        alpha: float = 0.0,
     ) -> tuple[Tensor, ActionConditionedOutput | None]:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -1126,36 +1211,55 @@ class VLAFlowMatching(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_outputs, past_key_values = self.vlm_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+            fill_kv_cache=True,
+        )
+        prefix_out = prefix_outputs[0]
+        stage_outputs = self.predict_stage(prefix_out, prefix_pad_masks)
+        z_hat = stage_outputs["stage_probs"] if stage_outputs is not None else None
+        blended_stage_condition = self.blend_stage_condition(stage_condition_probs, z_hat, alpha)
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
-        conditioned_suffix_embs, z_cond = self.apply_stage_condition(suffix_embs, stage_condition_probs)
+        conditioned_suffix_embs, z_cond = self.apply_stage_condition(suffix_embs, blended_stage_condition)
         model_outputs: ActionConditionedOutput | None = None
         if self.config.use_stage_conditioned_action:
             model_outputs = {
                 "action_hidden": suffix_embs.to(dtype=torch.float32),
                 "conditioned_action_hidden": conditioned_suffix_embs.to(dtype=torch.float32),
                 "action_target": u_t,
+                "alpha": u_t.new_tensor(alpha, dtype=torch.float32),
             }
             if z_cond is not None:
                 model_outputs["z_cond"] = z_cond
 
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
-            attention_mask=att_2d_masks,
-            position_ids=position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, conditioned_suffix_embs],
-            use_cache=False,
+        suffix_len = suffix_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        suffix_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        (_, suffix_out), _ = self.vlm_with_expert.forward(
+            attention_mask=full_att_2d_masks,
+            position_ids=suffix_position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[None, conditioned_suffix_embs],
+            use_cache=True,
             fill_kv_cache=False,
         )
-        stage_outputs = self.predict_stage(prefix_out, prefix_pad_masks)
         if stage_outputs is not None:
             if model_outputs is None:
-                model_outputs = {}
+                model_outputs = {"alpha": u_t.new_tensor(alpha, dtype=torch.float32)}
             model_outputs["stage_outputs"] = stage_outputs
+        elif model_outputs is None:
+            model_outputs = {"alpha": u_t.new_tensor(alpha, dtype=torch.float32)}
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
