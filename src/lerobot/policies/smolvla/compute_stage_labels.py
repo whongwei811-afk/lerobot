@@ -69,6 +69,11 @@ class _ActionChunkDataset(Dataset[dict[str, Tensor]]):
     only the columns needed for stage labeling and uses the dataset reader's
     delta-index utilities to build future action chunks without touching
     visual observations.
+
+    When auto-collation is enabled, :class:`torch.utils.data.DataLoader` can
+    call :meth:`__getitems__` with a full batch of indices. This lets us fetch
+    base columns and action rows in bulk instead of issuing dozens of Python-
+    level random accesses per batch.
     """
 
     def __init__(self, dataset: LeRobotDataset) -> None:
@@ -84,10 +89,60 @@ class _ActionChunkDataset(Dataset[dict[str, Tensor]]):
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> dict[str, Tensor]:
-        hf_dataset = self.reader.hf_dataset
-        if hf_dataset is None:
-            raise RuntimeError("The underlying HF dataset is not loaded.")
+        return self._get_single_item(idx)
 
+    def __getitems__(self, indices: list[int]) -> list[dict[str, Tensor]]:
+        if len(indices) == 0:
+            return []
+
+        hf_dataset = self._get_hf_dataset()
+        batch_indices = [int(idx) for idx in indices]
+        episode_indices = self._to_batched_tensor(hf_dataset["episode_index"][batch_indices])
+        absolute_indices = self._to_batched_tensor(hf_dataset["index"][batch_indices])
+        items = [
+            {
+                "episode_index": episode_indices[row_idx],
+                "index": absolute_indices[row_idx],
+            }
+            for row_idx in range(len(batch_indices))
+        ]
+
+        if self.reader.delta_indices is None:
+            action_batch = self._to_batched_tensor(hf_dataset[ACTION][batch_indices])
+            for row_idx, item in enumerate(items):
+                item[ACTION] = action_batch[row_idx]
+            return items
+
+        if ACTION not in self.reader.delta_indices:
+            raise KeyError(f"Delta indices are missing the '{ACTION}' key required for stage labeling.")
+
+        action_pad_key = f"{ACTION}_is_pad"
+        chunk_size = len(self.reader.delta_indices[ACTION])
+        batched_relative_indices: list[int] = []
+        batched_paddings: list[Tensor | None] = []
+
+        for row_idx in range(len(batch_indices)):
+            ep_idx = int(episode_indices[row_idx].item())
+            abs_idx = int(absolute_indices[row_idx].item())
+            query_indices, padding = self.reader._get_query_indices(abs_idx, ep_idx)
+            batched_relative_indices.extend(self._to_relative_indices(query_indices[ACTION]))
+            batched_paddings.append(padding.get(action_pad_key))
+
+        action_batch = self._get_action_chunk_batch(
+            relative_indices=batched_relative_indices,
+            batch_size=len(batch_indices),
+            chunk_size=chunk_size,
+        )
+
+        for row_idx, item in enumerate(items):
+            item[ACTION] = action_batch[row_idx]
+            action_is_pad = batched_paddings[row_idx]
+            if action_is_pad is not None:
+                item[action_pad_key] = action_is_pad
+
+        return items
+
+    def _get_single_item(self, idx: int) -> dict[str, Tensor]:
         episode_index = self._get_scalar_column("episode_index", idx)
         absolute_index = self._get_scalar_column("index", idx)
 
@@ -113,42 +168,56 @@ class _ActionChunkDataset(Dataset[dict[str, Tensor]]):
 
         return item
 
-    def _get_scalar_column(self, key: str, idx: int) -> Tensor:
+    def _get_hf_dataset(self):
         hf_dataset = self.reader.hf_dataset
         if hf_dataset is None:
             raise RuntimeError("The underlying HF dataset is not loaded.")
+        return hf_dataset
 
+    def _get_scalar_column(self, key: str, idx: int) -> Tensor:
+        hf_dataset = self._get_hf_dataset()
         value = hf_dataset[key][idx]
         if isinstance(value, Tensor):
             return value
         return torch.as_tensor(value)
 
     def _get_action_row(self, idx: int) -> Tensor:
-        hf_dataset = self.reader.hf_dataset
-        if hf_dataset is None:
-            raise RuntimeError("The underlying HF dataset is not loaded.")
-
+        hf_dataset = self._get_hf_dataset()
         action_value = hf_dataset[ACTION][idx]
         if isinstance(action_value, Tensor):
             return action_value
         return torch.as_tensor(action_value)
 
     def _get_action_chunk(self, relative_indices: list[int]) -> Tensor:
-        hf_dataset = self.reader.hf_dataset
-        if hf_dataset is None:
-            raise RuntimeError("The underlying HF dataset is not loaded.")
-
+        hf_dataset = self._get_hf_dataset()
         try:
             action_rows = hf_dataset[ACTION][relative_indices]
         except (TypeError, KeyError, IndexError):
             action_rows = hf_dataset[relative_indices][ACTION]
 
-        if isinstance(action_rows, Tensor):
-            return action_rows
+        return self._to_batched_tensor(action_rows)
 
-        return torch.stack(
-            [row if isinstance(row, Tensor) else torch.as_tensor(row) for row in action_rows]
-        )
+    def _get_action_chunk_batch(
+        self,
+        relative_indices: list[int],
+        batch_size: int,
+        chunk_size: int,
+    ) -> Tensor:
+        action_rows = self._get_action_chunk(relative_indices)
+        expected_rows = batch_size * chunk_size
+        if action_rows.shape[0] != expected_rows:
+            raise RuntimeError(
+                "Fetched action rows do not match the expected batch shape: "
+                f"got {action_rows.shape[0]} rows, expected {expected_rows}."
+            )
+        return action_rows.reshape(batch_size, chunk_size, *action_rows.shape[1:])
+
+    def _to_batched_tensor(self, value: Any) -> Tensor:
+        if isinstance(value, Tensor):
+            return value
+        if isinstance(value, list) and len(value) > 0 and isinstance(value[0], Tensor):
+            return torch.stack(value)
+        return torch.as_tensor(value)
 
     def _to_relative_indices(self, absolute_indices: list[int]) -> list[int]:
         if self.reader._absolute_to_relative_idx is None:
@@ -219,7 +288,13 @@ def build_argparser() -> argparse.ArgumentParser:
         "--num-workers",
         type=int,
         default=0,
-        help="Number of dataloader workers.",
+        help="Number of dataloader workers. Set above 0 to enable background prefetch.",
+    )
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=4,
+        help="Number of prefetched batches per worker. Ignored when --num-workers=0.",
     )
     parser.add_argument(
         "--train-steps",
@@ -453,10 +528,21 @@ def create_dataloader(
     dataset: LeRobotDataset | Dataset[dict[str, Tensor]],
     batch_size: int,
     num_workers: int,
+    prefetch_factor: int,
     shuffle: bool,
     device: torch.device,
 ) -> DataLoader[dict[str, Tensor]]:
     """Create a dataloader for action-only stage-labeler batches."""
+
+    if num_workers < 0:
+        raise ValueError(f"num_workers must be >= 0, got {num_workers}.")
+    if prefetch_factor <= 0:
+        raise ValueError(f"prefetch_factor must be > 0, got {prefetch_factor}.")
+    if device.type == "cuda" and num_workers == 0:
+        logging.info(
+            "DataLoader is running with num_workers=0, so CPU reads stay on the main process. "
+            "Increase --num-workers to overlap dataset prefetch with GPU compute."
+        )
 
     action_dataset: Dataset[dict[str, Tensor]]
     if isinstance(dataset, LeRobotDataset):
@@ -464,13 +550,19 @@ def create_dataloader(
     else:
         action_dataset = dataset
 
+    dataloader_kwargs: dict[str, Any] = {
+        "dataset": action_dataset,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "pin_memory": device.type == "cuda",
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        dataloader_kwargs["prefetch_factor"] = prefetch_factor
+
     return DataLoader(
-        action_dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=device.type == "cuda",
-        persistent_workers=num_workers > 0,
+        **dataloader_kwargs,
     )
 
 
@@ -480,6 +572,7 @@ def train_stage_labeler(
     device: torch.device,
     batch_size: int,
     num_workers: int,
+    prefetch_factor: int,
     train_steps: int,
     learning_rate: float,
     weight_decay: float,
@@ -496,6 +589,7 @@ def train_stage_labeler(
         dataset=dataset,
         batch_size=batch_size,
         num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
         shuffle=True,
         device=device,
     )
@@ -580,6 +674,7 @@ def generate_stage_label_dataframe(
     dataset: LeRobotDataset,
     batch_size: int,
     num_workers: int,
+    prefetch_factor: int,
     device: torch.device,
 ) -> pd.DataFrame:
     """Run the stage labeler over the dataset and return a stage-label dataframe."""
@@ -588,6 +683,7 @@ def generate_stage_label_dataframe(
         dataset=dataset,
         batch_size=batch_size,
         num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
         shuffle=False,
         device=device,
     )
@@ -794,6 +890,7 @@ def main() -> None:
             device=device,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
             train_steps=args.train_steps,
             learning_rate=args.learning_rate,
             weight_decay=args.weight_decay,
@@ -812,6 +909,7 @@ def main() -> None:
         dataset=dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
         device=device,
     )
 
