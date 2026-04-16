@@ -132,6 +132,9 @@ class SmolVLAConfig(PreTrainedConfig):
     alpha_warmup_steps: int = 10_000
     alpha_hold_steps: int = 0
     detach_pred_stage_for_action: bool = True
+    use_stage_condition_at_inference: bool = True
+    inference_stage_source: str = "predicted"
+    disable_stage_condition_for_eval: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -202,6 +205,11 @@ class SmolVLAConfig(PreTrainedConfig):
         if self.alpha_hold_steps < 0:
             raise ValueError(
                 f"`alpha_hold_steps` must be non-negative, got {self.alpha_hold_steps}."
+            )
+        if self.inference_stage_source != "predicted":
+            raise ValueError(
+                "`inference_stage_source` only supports 'predicted' in this stage, got "
+                f"'{self.inference_stage_source}'."
             )
 
     def validate_features(self) -> None:

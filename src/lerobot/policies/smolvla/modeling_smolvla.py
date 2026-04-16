@@ -389,6 +389,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions = self.model.sample_actions(
             images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
         )
+        self._cache_inference_stage_head_output()
 
         # Unpad actions
         original_action_dim = self.config.action_feature.shape[0]
@@ -486,6 +487,51 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def last_stage_head_output(self) -> dict[str, Tensor | None] | None:
         return self._last_stage_head_output
 
+    def _empty_stage_head_output_cache(self) -> dict[str, Tensor | None]:
+        return {
+            "stage_logits": None,
+            "stage_probs": None,
+            "stage_context": None,
+            "stage_label_probs": None,
+            "stage_loss": None,
+            "stage_loss_per_sample": None,
+            "alpha": None,
+            "z_cond": None,
+            "action_hidden": None,
+            "conditioned_action_hidden": None,
+            "action_pred": None,
+            "action_target": None,
+            "l_large_per_sample": None,
+            "l_small_per_sample": None,
+            "l_action": None,
+            "l_action_per_sample": None,
+            "total_loss": None,
+            "total_loss_per_sample": None,
+            "inference_p_global_mean": None,
+            "inference_p_local_mean": None,
+        }
+
+    def _cache_inference_stage_head_output(self) -> None:
+        inference_outputs = self.model.last_inference_stage_output
+        if inference_outputs is None:
+            self._last_stage_head_output = None
+            return
+
+        cached_outputs = self._empty_stage_head_output_cache()
+        stage_outputs = inference_outputs.get("stage_outputs")
+        if stage_outputs is not None:
+            cached_outputs["stage_logits"] = stage_outputs["stage_logits"].detach()
+            cached_outputs["stage_probs"] = stage_outputs["stage_probs"].detach()
+            cached_outputs["stage_context"] = stage_outputs["stage_context"].detach()
+            cached_outputs["inference_p_global_mean"] = stage_outputs["stage_probs"][:, 0].mean().detach()
+            cached_outputs["inference_p_local_mean"] = stage_outputs["stage_probs"][:, 1].mean().detach()
+
+        z_cond = inference_outputs.get("z_cond")
+        if z_cond is not None:
+            cached_outputs["z_cond"] = z_cond.detach()
+
+        self._last_stage_head_output = cached_outputs
+
     def _cache_stage_head_output(
         self,
         model_outputs: ActionConditionedOutput | None,
@@ -506,26 +552,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             self._last_stage_head_output = None
             return
 
-        cached_outputs: dict[str, Tensor | None] = {
-            "stage_logits": None,
-            "stage_probs": None,
-            "stage_context": None,
-            "stage_label_probs": None,
-            "stage_loss": None,
-            "stage_loss_per_sample": None,
-            "alpha": None,
-            "z_cond": None,
-            "action_hidden": None,
-            "conditioned_action_hidden": None,
-            "action_pred": None,
-            "action_target": None,
-            "l_large_per_sample": None,
-            "l_small_per_sample": None,
-            "l_action": None,
-            "l_action_per_sample": None,
-            "total_loss": None,
-            "total_loss_per_sample": None,
-        }
+        cached_outputs = self._empty_stage_head_output_cache()
         if stage_outputs is not None:
             cached_outputs["stage_logits"] = stage_outputs["stage_logits"].detach()
             cached_outputs["stage_probs"] = stage_outputs["stage_probs"].detach()
@@ -926,6 +953,7 @@ class VLAFlowMatching(nn.Module):
         self.image_end_token = torch.tensor([self.fake_image_token], dtype=torch.long)
         self.prefix_length = self.config.prefix_length
         self.rtc_processor = rtc_processor
+        self._last_inference_stage_output: dict[str, object] | None = None
 
         # Compile model if requested
         if config.compile_model:
@@ -935,6 +963,10 @@ class VLAFlowMatching(nn.Module):
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    @property
+    def last_inference_stage_output(self) -> dict[str, object] | None:
+        return self._last_inference_stage_output
 
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
@@ -955,6 +987,32 @@ class VLAFlowMatching(nn.Module):
         time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
         time = time_beta * 0.999 + 0.001
         return time
+
+    def encode_prefix_context(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        *,
+        use_cache: bool,
+    ) -> tuple[Tensor, Tensor, object]:
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_outputs, past_key_values = self.vlm_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=use_cache,
+            fill_kv_cache=True,
+        )
+        prefix_hidden_states = prefix_outputs[0]
+        return prefix_hidden_states, prefix_pad_masks, past_key_values
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
@@ -1126,6 +1184,48 @@ class VLAFlowMatching(nn.Module):
             "stage_probs": stage_probs,
         }
 
+    def should_use_stage_condition_at_inference(self) -> bool:
+        if not self.config.use_stage_condition_at_inference:
+            return False
+        if self.config.disable_stage_condition_for_eval:
+            return False
+        if self.config.inference_stage_source != "predicted":
+            raise ValueError(
+                "`inference_stage_source` only supports 'predicted' in this stage, got "
+                f"'{self.config.inference_stage_source}'."
+            )
+        return (
+            self.config.use_stage_head
+            and self.stage_head is not None
+            and self.config.use_stage_conditioned_action
+            and self.stage_film is not None
+        )
+
+    def get_inference_stage_condition(
+        self, prefix_hidden_states: Tensor, prefix_pad_masks: Tensor
+    ) -> tuple[Tensor | None, StageHeadOutput | None]:
+        self._last_inference_stage_output = None
+        if not self.should_use_stage_condition_at_inference():
+            return None, None
+
+        stage_outputs = self.predict_stage(prefix_hidden_states, prefix_pad_masks)
+        if stage_outputs is None:
+            return None, None
+
+        z_hat = stage_outputs["stage_probs"]
+        if z_hat.ndim != 2 or z_hat.shape[-1] != 2:
+            raise ValueError(
+                "Predicted stage probabilities must have shape [batch_size, 2], got "
+                f"{tuple(z_hat.shape)}."
+            )
+
+        z_cond = z_hat.to(dtype=torch.float32)
+        self._last_inference_stage_output = {
+            "stage_outputs": stage_outputs,
+            "z_cond": z_cond,
+        }
+        return z_cond, stage_outputs
+
     def blend_stage_condition(self, z: Tensor | None, z_hat: Tensor | None, alpha: float) -> Tensor | None:
         if z is None:
             return None
@@ -1208,20 +1308,14 @@ class VLAFlowMatching(nn.Module):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
-        )
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        prefix_outputs, past_key_values = self.vlm_with_expert.forward(
-            attention_mask=prefix_att_2d_masks,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
+        prefix_out, prefix_pad_masks, past_key_values = self.encode_prefix_context(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
             use_cache=True,
-            fill_kv_cache=True,
         )
-        prefix_out = prefix_outputs[0]
         stage_outputs = self.predict_stage(prefix_out, prefix_pad_masks)
         z_hat = stage_outputs["stage_probs"] if stage_outputs is not None else None
         blended_stage_condition = self.blend_stage_condition(stage_condition_probs, z_hat, alpha)
@@ -1293,20 +1387,15 @@ class VLAFlowMatching(nn.Module):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
-        )
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        # Compute image and language key value cache
-        _, past_key_values = self.vlm_with_expert.forward(
-            attention_mask=prefix_att_2d_masks,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
+        prefix_hidden_states, prefix_pad_masks, past_key_values = self.encode_prefix_context(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
             use_cache=self.config.use_cache,
-            fill_kv_cache=True,
         )
+        z_cond, _ = self.get_inference_stage_condition(prefix_hidden_states, prefix_pad_masks)
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
 
@@ -1321,6 +1410,7 @@ class VLAFlowMatching(nn.Module):
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
                     timestep=current_timestep,
+                    z_cond=z_cond,
                 )
 
             if self._rtc_enabled():
@@ -1352,10 +1442,11 @@ class VLAFlowMatching(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        z_cond: Tensor | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
-        conditioned_suffix_embs, _ = self.apply_stage_condition(suffix_embs, z_cond=None)
+        conditioned_suffix_embs, _ = self.apply_stage_condition(suffix_embs, z_cond=z_cond)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
