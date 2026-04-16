@@ -123,6 +123,7 @@ class SmolVLAConfig(PreTrainedConfig):
     stage_condition_mode: str = "film"
     stage_condition_hidden_dim: int = 128
     use_multiscale_action_loss: bool = True
+    action_multiscale_loss_weight: float = 0.25
     action_large_scale_mode: str = "fixed_lowpass"
     action_large_scale_kernel: int = 5
     use_alpha_schedule: bool = True
@@ -188,6 +189,11 @@ class SmolVLAConfig(PreTrainedConfig):
         if self.stage_condition_hidden_dim <= 0:
             raise ValueError(
                 f"`stage_condition_hidden_dim` must be positive, got {self.stage_condition_hidden_dim}."
+            )
+        if self.action_multiscale_loss_weight < 0.0:
+            raise ValueError(
+                "`action_multiscale_loss_weight` must be non-negative, got "
+                f"{self.action_multiscale_loss_weight}."
             )
         if self.action_large_scale_mode != "fixed_lowpass":
             raise ValueError(

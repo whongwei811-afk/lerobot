@@ -495,16 +495,23 @@ class SmolVLAPolicy(PreTrainedPolicy):
             "stage_label_probs": None,
             "stage_loss": None,
             "stage_loss_per_sample": None,
+            "l_stage": None,
             "alpha": None,
             "z_cond": None,
             "action_hidden": None,
             "conditioned_action_hidden": None,
             "action_pred": None,
             "action_target": None,
+            "l_fm": None,
+            "l_fm_per_sample": None,
+            "l_large": None,
             "l_large_per_sample": None,
+            "l_small": None,
             "l_small_per_sample": None,
             "l_action": None,
             "l_action_per_sample": None,
+            "action_loss": None,
+            "action_loss_per_sample": None,
             "total_loss": None,
             "total_loss_per_sample": None,
             "inference_p_global_mean": None,
@@ -537,9 +544,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
         model_outputs: ActionConditionedOutput | None,
         stage_label_probs: Tensor | None,
         stage_loss_per_sample: Tensor | None,
+        fm_loss_per_sample: Tensor | None,
         l_large_per_sample: Tensor | None,
         l_small_per_sample: Tensor | None,
         l_action_per_sample: Tensor | None,
+        action_loss_per_sample: Tensor | None,
         total_loss_per_sample: Tensor | None,
     ) -> None:
         stage_outputs = model_outputs.get("stage_outputs") if model_outputs is not None else None
@@ -577,13 +586,22 @@ class SmolVLAPolicy(PreTrainedPolicy):
         if stage_loss_per_sample is not None:
             cached_outputs["stage_loss_per_sample"] = stage_loss_per_sample.detach()
             cached_outputs["stage_loss"] = stage_loss_per_sample.mean().detach()
+            cached_outputs["l_stage"] = stage_loss_per_sample.mean().detach()
+        if fm_loss_per_sample is not None:
+            cached_outputs["l_fm_per_sample"] = fm_loss_per_sample.detach()
+            cached_outputs["l_fm"] = fm_loss_per_sample.mean().detach()
         if l_large_per_sample is not None:
             cached_outputs["l_large_per_sample"] = l_large_per_sample.detach()
+            cached_outputs["l_large"] = l_large_per_sample.mean().detach()
         if l_small_per_sample is not None:
             cached_outputs["l_small_per_sample"] = l_small_per_sample.detach()
+            cached_outputs["l_small"] = l_small_per_sample.mean().detach()
         if l_action_per_sample is not None:
             cached_outputs["l_action_per_sample"] = l_action_per_sample.detach()
             cached_outputs["l_action"] = l_action_per_sample.mean().detach()
+        if action_loss_per_sample is not None:
+            cached_outputs["action_loss_per_sample"] = action_loss_per_sample.detach()
+            cached_outputs["action_loss"] = action_loss_per_sample.mean().detach()
         if total_loss_per_sample is not None:
             cached_outputs["total_loss_per_sample"] = total_loss_per_sample.detach()
             cached_outputs["total_loss"] = total_loss_per_sample.mean().detach()
@@ -672,8 +690,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
         # Remove padding
         losses = losses[:, :, : self.config.max_action_dim]
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
+        fm_loss_per_sample = losses.mean(dim=(1, 2))
         l_large_per_sample = None
         l_small_per_sample = None
+        action_multiscale_per_sample = None
         z_cond_for_logging = None
         if model_outputs is not None and model_outputs.get("z_cond") is not None:
             z_cond_for_logging = model_outputs["z_cond"]
@@ -706,11 +726,15 @@ class SmolVLAPolicy(PreTrainedPolicy):
             l_small_elementwise = l_small_elementwise[:, :, : self.config.max_action_dim]
             l_large_per_sample = l_large_elementwise.mean(dim=(1, 2))
             l_small_per_sample = l_small_elementwise.mean(dim=(1, 2))
-            action_loss_per_sample = z_cond[:, 0] * l_large_per_sample + z_cond[:, 1] * l_small_per_sample
-            loss_dict["l_large"] = l_large_per_sample.mean().item()
-            loss_dict["l_small"] = l_small_per_sample.mean().item()
+            action_multiscale_per_sample = (
+                z_cond[:, 0] * l_large_per_sample + z_cond[:, 1] * l_small_per_sample
+            )
+            action_loss_per_sample = (
+                fm_loss_per_sample
+                + self.config.action_multiscale_loss_weight * action_multiscale_per_sample
+            )
         else:
-            action_loss_per_sample = losses.mean(dim=(1, 2))
+            action_loss_per_sample = fm_loss_per_sample
 
         if stage_loss_per_sample is not None:
             total_loss_per_sample = (
@@ -722,13 +746,22 @@ class SmolVLAPolicy(PreTrainedPolicy):
             model_outputs,
             stage_label_probs,
             stage_loss_per_sample,
+            fm_loss_per_sample,
             l_large_per_sample,
             l_small_per_sample,
+            action_multiscale_per_sample,
             action_loss_per_sample,
             total_loss_per_sample,
         )
+        loss_dict["l_fm"] = fm_loss_per_sample.mean().item()
+        loss_dict["l_action"] = (
+            action_multiscale_per_sample.mean().item()
+            if action_multiscale_per_sample is not None
+            else 0.0
+        )
+        loss_dict["l_large"] = l_large_per_sample.mean().item() if l_large_per_sample is not None else 0.0
+        loss_dict["l_small"] = l_small_per_sample.mean().item() if l_small_per_sample is not None else 0.0
         loss_dict["action_loss"] = action_loss_per_sample.mean().item()
-        loss_dict["l_action"] = action_loss_per_sample.mean().item()
         loss_dict["l_stage"] = stage_loss_per_sample.mean().item() if stage_loss_per_sample is not None else 0.0
         loss_dict["total_loss"] = total_loss_per_sample.mean().item()
 
@@ -1279,6 +1312,7 @@ class VLAFlowMatching(nn.Module):
     def compute_multiscale_action_loss(
         self, action_pred: Tensor, action_target: Tensor
     ) -> tuple[Tensor, Tensor]:
+        """Compute large/small action-chunk losses after fixed low-pass decomposition."""
         action_pred_large, action_pred_small = self.decompose_action_scales(action_pred)
         action_target_large, action_target_small = self.decompose_action_scales(action_target)
         l_large = F.mse_loss(action_pred_large, action_target_large, reduction="none")
@@ -1326,7 +1360,8 @@ class VLAFlowMatching(nn.Module):
             model_outputs = {
                 "action_hidden": suffix_embs.to(dtype=torch.float32),
                 "conditioned_action_hidden": conditioned_suffix_embs.to(dtype=torch.float32),
-                "action_target": u_t,
+                # L_fm stays on the corrective field (u_t, v_t), while L_action is computed in action space.
+                "action_target": actions,
                 "alpha": u_t.new_tensor(alpha, dtype=torch.float32),
             }
             if z_cond is not None:
@@ -1358,10 +1393,13 @@ class VLAFlowMatching(nn.Module):
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
-        if model_outputs is not None:
-            model_outputs["action_pred"] = v_t
+        action_pred = noise - v_t
+        if model_outputs is not None and self.config.use_stage_conditioned_action:
+            model_outputs["action_pred"] = action_pred
         if self.config.use_stage_conditioned_action and self.config.use_multiscale_action_loss:
-            l_large_elementwise, l_small_elementwise = self.compute_multiscale_action_loss(v_t, u_t)
+            l_large_elementwise, l_small_elementwise = self.compute_multiscale_action_loss(
+                action_pred, actions
+            )
             if model_outputs is None:
                 model_outputs = {}
             model_outputs["l_large_elementwise"] = l_large_elementwise
