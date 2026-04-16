@@ -118,6 +118,14 @@ class SmolVLAConfig(PreTrainedConfig):
     stage_loss_weight: float = 0.1
     stage_pooling: str = "last_state_token"
 
+    # Optional teacher stage conditioning on the action branch.
+    use_stage_conditioned_action: bool = False
+    stage_condition_mode: str = "film"
+    stage_condition_hidden_dim: int = 128
+    use_multiscale_action_loss: bool = True
+    action_large_scale_mode: str = "fixed_lowpass"
+    action_large_scale_kernel: int = 5
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -162,6 +170,23 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError(
                 "`stage_pooling` must be one of {'last_state_token', 'mean'}, got "
                 f"'{self.stage_pooling}'."
+            )
+        if self.stage_condition_mode != "film":
+            raise ValueError(
+                f"`stage_condition_mode` only supports 'film' in this stage, got '{self.stage_condition_mode}'."
+            )
+        if self.stage_condition_hidden_dim <= 0:
+            raise ValueError(
+                f"`stage_condition_hidden_dim` must be positive, got {self.stage_condition_hidden_dim}."
+            )
+        if self.action_large_scale_mode != "fixed_lowpass":
+            raise ValueError(
+                "`action_large_scale_mode` only supports 'fixed_lowpass' in this stage, got "
+                f"'{self.action_large_scale_mode}'."
+            )
+        if self.action_large_scale_kernel <= 0:
+            raise ValueError(
+                f"`action_large_scale_kernel` must be positive, got {self.action_large_scale_kernel}."
             )
 
     def validate_features(self) -> None:

@@ -85,6 +85,17 @@ class StageHeadOutput(TypedDict, total=False):
     stage_probs: Tensor
 
 
+class ActionConditionedOutput(TypedDict, total=False):
+    stage_outputs: StageHeadOutput | None
+    action_hidden: Tensor
+    conditioned_action_hidden: Tensor
+    action_pred: Tensor
+    action_target: Tensor
+    z_cond: Tensor
+    l_large_elementwise: Tensor
+    l_small_elementwise: Tensor
+
+
 def create_sinusoidal_pos_embedding(
     time: torch.tensor, dimension: int, min_period: float, max_period: float, device="cpu"
 ) -> Tensor:
@@ -248,6 +259,25 @@ class StageHead(nn.Module):
 
     def forward(self, hidden_state: Tensor) -> Tensor:
         return self.mlp(hidden_state)
+
+
+class StageFiLM(nn.Module):
+    """Generate FiLM parameters from stage probabilities."""
+
+    def __init__(self, condition_dim: int, hidden_dim: int, output_dim: int) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(condition_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim * 2),
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, z_cond: Tensor) -> tuple[Tensor, Tensor]:
+        gamma_delta, beta = self.mlp(z_cond).chunk(2, dim=-1)
+        gamma = 1.0 + gamma_delta
+        return gamma, beta
 
 
 class SmolVLAPolicy(PreTrainedPolicy):
@@ -420,11 +450,21 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     def _cache_stage_head_output(
         self,
-        stage_outputs: StageHeadOutput | None,
+        model_outputs: ActionConditionedOutput | None,
         stage_label_probs: Tensor | None,
         stage_loss_per_sample: Tensor | None,
+        l_large_per_sample: Tensor | None,
+        l_small_per_sample: Tensor | None,
+        l_action_per_sample: Tensor | None,
+        total_loss_per_sample: Tensor | None,
     ) -> None:
-        if stage_outputs is None and stage_label_probs is None and stage_loss_per_sample is None:
+        stage_outputs = model_outputs.get("stage_outputs") if model_outputs is not None else None
+        if (
+            stage_outputs is None
+            and model_outputs is None
+            and stage_label_probs is None
+            and stage_loss_per_sample is None
+        ):
             self._last_stage_head_output = None
             return
 
@@ -435,16 +475,50 @@ class SmolVLAPolicy(PreTrainedPolicy):
             "stage_label_probs": None,
             "stage_loss": None,
             "stage_loss_per_sample": None,
+            "z_cond": None,
+            "action_hidden": None,
+            "conditioned_action_hidden": None,
+            "action_pred": None,
+            "action_target": None,
+            "l_large_per_sample": None,
+            "l_small_per_sample": None,
+            "l_action": None,
+            "l_action_per_sample": None,
+            "total_loss": None,
+            "total_loss_per_sample": None,
         }
         if stage_outputs is not None:
             cached_outputs["stage_logits"] = stage_outputs["stage_logits"].detach()
             cached_outputs["stage_probs"] = stage_outputs["stage_probs"].detach()
             cached_outputs["stage_context"] = stage_outputs["stage_context"].detach()
+        if model_outputs is not None:
+            if model_outputs.get("z_cond") is not None:
+                cached_outputs["z_cond"] = model_outputs["z_cond"].detach()
+            if model_outputs.get("action_hidden") is not None:
+                cached_outputs["action_hidden"] = model_outputs["action_hidden"].detach()
+            if model_outputs.get("conditioned_action_hidden") is not None:
+                cached_outputs["conditioned_action_hidden"] = model_outputs[
+                    "conditioned_action_hidden"
+                ].detach()
+            if model_outputs.get("action_pred") is not None:
+                cached_outputs["action_pred"] = model_outputs["action_pred"].detach()
+            if model_outputs.get("action_target") is not None:
+                cached_outputs["action_target"] = model_outputs["action_target"].detach()
         if stage_label_probs is not None:
             cached_outputs["stage_label_probs"] = stage_label_probs.detach()
         if stage_loss_per_sample is not None:
             cached_outputs["stage_loss_per_sample"] = stage_loss_per_sample.detach()
             cached_outputs["stage_loss"] = stage_loss_per_sample.mean().detach()
+        if l_large_per_sample is not None:
+            cached_outputs["l_large_per_sample"] = l_large_per_sample.detach()
+        if l_small_per_sample is not None:
+            cached_outputs["l_small_per_sample"] = l_small_per_sample.detach()
+        if l_action_per_sample is not None:
+            cached_outputs["l_action_per_sample"] = l_action_per_sample.detach()
+            cached_outputs["l_action"] = l_action_per_sample.mean().detach()
+        if total_loss_per_sample is not None:
+            cached_outputs["total_loss_per_sample"] = total_loss_per_sample.detach()
+            cached_outputs["total_loss"] = total_loss_per_sample.mean().detach()
         self._last_stage_head_output = cached_outputs
 
     def forward(
@@ -476,9 +550,18 @@ class SmolVLAPolicy(PreTrainedPolicy):
             # Keep stage labels local to the policy forward pass for future stage-aware losses.
             loss_dict["stage_probs_mean_global"] = stage_label_probs[:, 0].mean().item()
             loss_dict["stage_probs_mean_local"] = stage_label_probs[:, 1].mean().item()
-        losses, stage_outputs = self.model.forward(
-            images, img_masks, lang_tokens, lang_masks, state, actions, noise, time
+        losses, model_outputs = self.model.forward(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            actions,
+            noise,
+            time,
+            stage_condition_probs=stage_label_probs,
         )
+        stage_outputs = model_outputs.get("stage_outputs") if model_outputs is not None else None
         stage_loss_per_sample = None
         if stage_outputs is not None:
             stage_probs = stage_outputs["stage_probs"]
@@ -494,7 +577,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 )
             else:
                 loss_dict["stage_loss"] = 0.0
-        self._cache_stage_head_output(stage_outputs, stage_label_probs, stage_loss_per_sample)
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
@@ -507,14 +589,55 @@ class SmolVLAPolicy(PreTrainedPolicy):
         # Remove padding
         losses = losses[:, :, : self.config.max_action_dim]
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
-        action_loss_per_sample = losses.mean(dim=(1, 2))
+        l_large_per_sample = None
+        l_small_per_sample = None
+        if (
+            self.config.use_stage_conditioned_action
+            and self.config.use_multiscale_action_loss
+            and model_outputs is not None
+            and model_outputs.get("z_cond") is not None
+            and model_outputs.get("l_large_elementwise") is not None
+            and model_outputs.get("l_small_elementwise") is not None
+        ):
+            z_cond = model_outputs["z_cond"]
+            loss_dict["z_cond_mean_global"] = z_cond[:, 0].mean().item()
+            loss_dict["z_cond_mean_local"] = z_cond[:, 1].mean().item()
+
+            l_large_elementwise = model_outputs["l_large_elementwise"][:, :, :original_action_dim]
+            l_small_elementwise = model_outputs["l_small_elementwise"][:, :, :original_action_dim]
+            if actions_is_pad is not None:
+                l_large_elementwise = l_large_elementwise * in_episode_bound.unsqueeze(-1)
+                l_small_elementwise = l_small_elementwise * in_episode_bound.unsqueeze(-1)
+
+            l_large_elementwise = l_large_elementwise[:, :, : self.config.max_action_dim]
+            l_small_elementwise = l_small_elementwise[:, :, : self.config.max_action_dim]
+            l_large_per_sample = l_large_elementwise.mean(dim=(1, 2))
+            l_small_per_sample = l_small_elementwise.mean(dim=(1, 2))
+            action_loss_per_sample = z_cond[:, 0] * l_large_per_sample + z_cond[:, 1] * l_small_per_sample
+            loss_dict["l_large"] = l_large_per_sample.mean().item()
+            loss_dict["l_small"] = l_small_per_sample.mean().item()
+        else:
+            action_loss_per_sample = losses.mean(dim=(1, 2))
+
         if stage_loss_per_sample is not None:
             total_loss_per_sample = (
                 action_loss_per_sample + self.config.stage_loss_weight * stage_loss_per_sample
             )
         else:
             total_loss_per_sample = action_loss_per_sample
+        self._cache_stage_head_output(
+            model_outputs,
+            stage_label_probs,
+            stage_loss_per_sample,
+            l_large_per_sample,
+            l_small_per_sample,
+            action_loss_per_sample,
+            total_loss_per_sample,
+        )
         loss_dict["action_loss"] = action_loss_per_sample.mean().item()
+        loss_dict["l_action"] = action_loss_per_sample.mean().item()
+        loss_dict["l_stage"] = stage_loss_per_sample.mean().item() if stage_loss_per_sample is not None else 0.0
+        loss_dict["total_loss"] = total_loss_per_sample.mean().item()
 
         if reduction == "none":
             loss_dict["loss"] = total_loss_per_sample.mean().item()
@@ -609,7 +732,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
         common_projections = (
             "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
         )
-        target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
+        head_projections = r"stage_head\.mlp\.(0|2)|stage_film\.mlp\.(0|2)"
+        target_modules = (
+            rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections})|"
+            rf"model\.({head_projections}))"
+        )
         return {
             "target_modules": target_modules,
             "modules_to_save": [],
@@ -709,6 +836,13 @@ class VLAFlowMatching(nn.Module):
             self.stage_head = StageHead(
                 self.vlm_with_expert.config.text_config.hidden_size,
                 self.config.stage_head_hidden_dim,
+            )
+        self.stage_film = None
+        if self.config.use_stage_conditioned_action:
+            self.stage_film = StageFiLM(
+                condition_dim=2,
+                hidden_dim=self.config.stage_condition_hidden_dim,
+                output_dim=self.vlm_with_expert.expert_hidden_size,
             )
 
         self.set_requires_grad()
@@ -922,9 +1056,63 @@ class VLAFlowMatching(nn.Module):
             "stage_probs": stage_probs,
         }
 
+    def apply_stage_condition(
+        self, action_hidden: Tensor, z_cond: Tensor | None
+    ) -> tuple[Tensor, Tensor | None]:
+        if not self.config.use_stage_conditioned_action or self.stage_film is None:
+            return action_hidden, None
+
+        if z_cond is None:
+            z_cond = torch.full((action_hidden.shape[0], 2), 0.5, dtype=torch.float32, device=action_hidden.device)
+        else:
+            z_cond = z_cond.to(device=action_hidden.device, dtype=torch.float32)
+
+        gamma, beta = self.stage_film(z_cond)
+        gamma = gamma.to(dtype=action_hidden.dtype).unsqueeze(1)
+        beta = beta.to(dtype=action_hidden.dtype).unsqueeze(1)
+        conditioned_hidden = gamma * action_hidden + beta
+        return conditioned_hidden, z_cond
+
+    def decompose_action_scales(self, action_chunk: Tensor) -> tuple[Tensor, Tensor]:
+        if self.config.action_large_scale_mode != "fixed_lowpass":
+            raise ValueError(
+                f"Unsupported action large-scale mode '{self.config.action_large_scale_mode}'."
+            )
+
+        kernel = self.config.action_large_scale_kernel
+        if kernel == 1:
+            action_large = action_chunk
+        else:
+            action_chunk_t = action_chunk.transpose(1, 2)
+            pad_left = (kernel - 1) // 2
+            pad_right = kernel // 2
+            padded_action = F.pad(action_chunk_t, (pad_left, pad_right), mode="replicate")
+            action_large = F.avg_pool1d(padded_action, kernel_size=kernel, stride=1).transpose(1, 2)
+
+        action_small = action_chunk - action_large
+        return action_large, action_small
+
+    def compute_multiscale_action_loss(
+        self, action_pred: Tensor, action_target: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        action_pred_large, action_pred_small = self.decompose_action_scales(action_pred)
+        action_target_large, action_target_small = self.decompose_action_scales(action_target)
+        l_large = F.mse_loss(action_pred_large, action_target_large, reduction="none")
+        l_small = F.mse_loss(action_pred_small, action_target_small, reduction="none")
+        return l_large, l_small
+
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
-    ) -> tuple[Tensor, StageHeadOutput | None]:
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        noise=None,
+        time=None,
+        stage_condition_probs: Tensor | None = None,
+    ) -> tuple[Tensor, ActionConditionedOutput | None]:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -939,6 +1127,16 @@ class VLAFlowMatching(nn.Module):
             images, img_masks, lang_tokens, lang_masks, state=state
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
+        conditioned_suffix_embs, z_cond = self.apply_stage_condition(suffix_embs, stage_condition_probs)
+        model_outputs: ActionConditionedOutput | None = None
+        if self.config.use_stage_conditioned_action:
+            model_outputs = {
+                "action_hidden": suffix_embs.to(dtype=torch.float32),
+                "conditioned_action_hidden": conditioned_suffix_embs.to(dtype=torch.float32),
+                "action_target": u_t,
+            }
+            if z_cond is not None:
+                model_outputs["z_cond"] = z_cond
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -949,17 +1147,29 @@ class VLAFlowMatching(nn.Module):
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
-            inputs_embeds=[prefix_embs, suffix_embs],
+            inputs_embeds=[prefix_embs, conditioned_suffix_embs],
             use_cache=False,
             fill_kv_cache=False,
         )
         stage_outputs = self.predict_stage(prefix_out, prefix_pad_masks)
+        if stage_outputs is not None:
+            if model_outputs is None:
+                model_outputs = {}
+            model_outputs["stage_outputs"] = stage_outputs
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
+        if model_outputs is not None:
+            model_outputs["action_pred"] = v_t
+        if self.config.use_stage_conditioned_action and self.config.use_multiscale_action_loss:
+            l_large_elementwise, l_small_elementwise = self.compute_multiscale_action_loss(v_t, u_t)
+            if model_outputs is None:
+                model_outputs = {}
+            model_outputs["l_large_elementwise"] = l_large_elementwise
+            model_outputs["l_small_elementwise"] = l_small_elementwise
         losses = F.mse_loss(u_t, v_t, reduction="none")
-        return losses, stage_outputs
+        return losses, model_outputs
 
     def sample_actions(
         self,
@@ -1041,6 +1251,7 @@ class VLAFlowMatching(nn.Module):
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
+        conditioned_suffix_embs, _ = self.apply_stage_condition(suffix_embs, z_cond=None)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -1057,7 +1268,7 @@ class VLAFlowMatching(nn.Module):
             attention_mask=full_att_2d_masks,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs],
+            inputs_embeds=[None, conditioned_suffix_embs],
             use_cache=self.config.use_cache,
             fill_kv_cache=False,
         )
