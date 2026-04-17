@@ -259,6 +259,9 @@ class StageHead(nn.Module):
         )
 
     def forward(self, hidden_state: Tensor) -> Tensor:
+        first_linear = self.mlp[0]
+        if isinstance(first_linear, nn.Linear):
+            hidden_state = hidden_state.to(dtype=first_linear.weight.dtype)
         return self.mlp(hidden_state)
 
 

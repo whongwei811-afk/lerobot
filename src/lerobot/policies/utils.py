@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+import re
 from collections import deque
 
 import numpy as np
@@ -220,6 +221,83 @@ def raise_feature_mismatch_error(
         f'  --rename_map=\'{{"observation.images.left": "observation.images.camera1", '
         f'"observation.images.top": "observation.images.camera2"}}\''
     )
+
+
+_CAMERA_VISUAL_KEY_PATTERN = re.compile(r"^observation\.images\.camera\d+$")
+_LIBERO_VISUAL_KEY_PATTERN = re.compile(r"^observation\.images\.image\d*$")
+
+
+def align_visual_features_to_dataset(
+    cfg: PreTrainedConfig,
+    features: dict[str, PolicyFeature],
+) -> bool:
+    """Align SmolVLA camera-style visual keys to LIBERO image/image2 keys.
+
+    SmolVLA checkpoints such as ``smolvla_base`` may declare visual features as
+    ``observation.images.camera1``/``camera2``/``camera3``. LIBERO datasets and
+    environments expose the same modalities as ``observation.images.image`` and
+    ``observation.images.image2``. The model itself consumes a list of images and
+    does not depend on the original key names, so we can safely rewrite the first
+    visual slots in the loaded config to match the dataset feature schema while
+    keeping any additional cameras optional.
+
+    Returns:
+        ``True`` when the config was rewritten, ``False`` otherwise.
+    """
+
+    if cfg.type != "smolvla" or not cfg.input_features:
+        return False
+
+    expected_visual_items = [
+        (key, ft) for key, ft in cfg.input_features.items() if ft.type == FeatureType.VISUAL
+    ]
+    provided_visual_items = [
+        (key, ft) for key, ft in features.items() if ft.type == FeatureType.VISUAL
+    ]
+
+    if not expected_visual_items or not provided_visual_items:
+        return False
+
+    expected_visual_keys = [key for key, _ in expected_visual_items]
+    provided_visual_keys = [key for key, _ in provided_visual_items]
+    expected_visual_set = set(expected_visual_keys)
+    provided_visual_set = set(provided_visual_keys)
+
+    if expected_visual_set.issubset(provided_visual_set) or provided_visual_set.issubset(expected_visual_set):
+        return False
+
+    if len(provided_visual_items) > len(expected_visual_items):
+        return False
+
+    if not all(
+        _CAMERA_VISUAL_KEY_PATTERN.match(key)
+        for key in expected_visual_keys[: len(provided_visual_items)]
+    ):
+        return False
+    if not all(_LIBERO_VISUAL_KEY_PATTERN.match(key) for key in provided_visual_keys):
+        return False
+
+    replacements = {
+        expected_key: (provided_key, provided_feature)
+        for (expected_key, _), (provided_key, provided_feature) in zip(
+            expected_visual_items, provided_visual_items, strict=False
+        )
+    }
+
+    aligned_input_features: dict[str, PolicyFeature] = {}
+    for key, feature in cfg.input_features.items():
+        replacement = replacements.get(key)
+        if replacement is None:
+            aligned_input_features[key] = feature
+            continue
+
+        aligned_key, aligned_feature = replacement
+        aligned_input_features[aligned_key] = aligned_feature
+
+    cfg.input_features = aligned_input_features
+    mapping = ", ".join(f"{src} -> {dst}" for src, (dst, _) in replacements.items())
+    logging.info("Aligned SmolVLA visual features to dataset schema: %s", mapping)
+    return True
 
 
 def validate_visual_features_consistency(

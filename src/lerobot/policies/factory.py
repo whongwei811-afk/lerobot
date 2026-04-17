@@ -56,7 +56,7 @@ from .sac.reward_model.configuration_classifier import RewardClassifierConfig
 from .sarm.configuration_sarm import SARMConfig
 from .smolvla.configuration_smolvla import SmolVLAConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig
-from .utils import validate_visual_features_consistency
+from .utils import align_visual_features_to_dataset, validate_visual_features_consistency
 from .vqbet.configuration_vqbet import VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig
 from .xvla.configuration_xvla import XVLAConfig
@@ -504,6 +504,8 @@ def make_policy(
             raise ValueError("env_cfg cannot be None when ds_meta is not provided")
         features = env_to_policy_features(env_cfg)
 
+    if not rename_map:
+        align_visual_features_to_dataset(cfg, features)
     cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     if not cfg.input_features:
         cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
