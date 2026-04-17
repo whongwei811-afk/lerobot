@@ -126,8 +126,9 @@ class SmolVLAConfig(PreTrainedConfig):
     action_multiscale_loss_weight: float = 0.25
     action_large_scale_mode: str = "fixed_lowpass"
     action_large_scale_kernel: int = 5
+    train_metric_window_size: int = 100
     use_alpha_schedule: bool = True
-    alpha_schedule: str = "linear"
+    alpha_schedule: str = "cosine"
     alpha_start: float = 0.0
     alpha_end: float = 1.0
     alpha_warmup_steps: int = 10_000
@@ -204,9 +205,15 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError(
                 f"`action_large_scale_kernel` must be positive, got {self.action_large_scale_kernel}."
             )
-        if self.alpha_schedule != "linear":
+        if self.train_metric_window_size <= 0:
             raise ValueError(
-                f"`alpha_schedule` only supports 'linear' in this stage, got '{self.alpha_schedule}'."
+                "`train_metric_window_size` must be positive, "
+                f"got {self.train_metric_window_size}."
+            )
+        if self.alpha_schedule not in {"linear", "cosine"}:
+            raise ValueError(
+                "`alpha_schedule` must be one of {'linear', 'cosine'} in this stage, "
+                f"got '{self.alpha_schedule}'."
             )
         if self.alpha_hold_steps < 0:
             raise ValueError(

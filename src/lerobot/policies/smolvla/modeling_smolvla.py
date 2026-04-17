@@ -289,6 +289,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     config_class = SmolVLAConfig
     name = "smolvla"
+    _SMOOTHED_TRAIN_METRIC_KEYS = ("stage_loss", "stage_agreement", "l_stage")
 
     def __init__(
         self,
@@ -307,6 +308,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self.register_buffer("num_updates", torch.zeros((), dtype=torch.long), persistent=False)
         self._stage_label_provider: StageLabelProvider | None = None
         self._last_stage_head_output: dict[str, Tensor | None] | None = None
+        self._train_metric_windows = {
+            key: deque(maxlen=self.config.train_metric_window_size) for key in self._SMOOTHED_TRAIN_METRIC_KEYS
+        }
         self.init_rtc_processor()
         self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
         self.reset()
@@ -339,13 +343,31 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def update(self) -> None:
         self.num_updates.add_(1)
 
+    def _build_train_log_dict(self, alpha: float, stage_loss: float, stage_agreement: float, l_stage: float) -> dict[str, float]:
+        metrics = {
+            "alpha": float(alpha),
+            "stage_loss": float(stage_loss),
+            "stage_agreement": float(stage_agreement),
+            "l_stage": float(l_stage),
+        }
+        smoothed_metrics = {"alpha": metrics["alpha"]}
+        for key in self._SMOOTHED_TRAIN_METRIC_KEYS:
+            value = metrics[key]
+            if not math.isfinite(value):
+                continue
+            metric_window = self._train_metric_windows[key]
+            metric_window.append(value)
+            smoothed_metrics[key] = sum(metric_window) / len(metric_window)
+        return smoothed_metrics
+
     def compute_alpha(self) -> float:
         if not self.config.use_alpha_schedule:
             return float(self.config.alpha_start)
 
-        if self.config.alpha_schedule != "linear":
+        if self.config.alpha_schedule not in {"linear", "cosine"}:
             raise ValueError(
-                f"`alpha_schedule` only supports 'linear' in this stage, got '{self.config.alpha_schedule}'."
+                "`alpha_schedule` must be one of {'linear', 'cosine'} in this stage, "
+                f"got '{self.config.alpha_schedule}'."
             )
 
         if self.config.alpha_warmup_steps <= 0:
@@ -361,9 +383,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
             alpha = self.config.alpha_end
         else:
             progress = float(t - hold) / float(warm)
-            alpha = self.config.alpha_start + progress * (
-                self.config.alpha_end - self.config.alpha_start
-            )
+            if self.config.alpha_schedule == "linear":
+                mix = progress
+            else:
+                mix = 0.5 * (1.0 - math.cos(math.pi * progress))
+            alpha = self.config.alpha_start + mix * (self.config.alpha_end - self.config.alpha_start)
 
         alpha_min = min(self.config.alpha_start, self.config.alpha_end)
         alpha_max = max(self.config.alpha_start, self.config.alpha_end)
@@ -635,18 +659,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
         stage_label_probs = self._maybe_get_batch_stage_probs(batch, device=actions.device)
         actions_is_pad = batch.get("action_is_pad")
         alpha = self.compute_alpha()
-        loss_dict = {
-            "alpha": alpha,
-            "stage_agreement": math.nan,
-            "z_p_global_mean": math.nan,
-            "zhat_p_global_mean": math.nan,
-            "zcond_p_global_mean": math.nan,
-        }
-        if stage_label_probs is not None:
-            # Keep stage labels local to the policy forward pass for future stage-aware losses.
-            loss_dict["stage_probs_mean_global"] = stage_label_probs[:, 0].mean().item()
-            loss_dict["stage_probs_mean_local"] = stage_label_probs[:, 1].mean().item()
-            loss_dict["z_p_global_mean"] = stage_label_probs[:, 0].mean().item()
         losses, model_outputs = self.model.forward(
             images,
             img_masks,
@@ -661,51 +673,32 @@ class SmolVLAPolicy(PreTrainedPolicy):
         )
         stage_outputs = model_outputs.get("stage_outputs") if model_outputs is not None else None
         stage_loss_per_sample = None
+        stage_agreement_value = math.nan
+        stage_loss_value = 0.0
         if stage_outputs is not None:
             stage_probs = stage_outputs["stage_probs"]
-            loss_dict["stage_head_probs_mean_global"] = stage_probs[:, 0].mean().item()
-            loss_dict["stage_head_probs_mean_local"] = stage_probs[:, 1].mean().item()
-            loss_dict["zhat_p_global_mean"] = stage_probs[:, 0].mean().item()
             if stage_label_probs is not None:
                 stage_agreement = (
                     stage_label_probs.argmax(dim=-1) == stage_probs.argmax(dim=-1)
                 ).to(dtype=torch.float32)
-                loss_dict["stage_agreement"] = stage_agreement.mean().item()
+                stage_agreement_value = stage_agreement.mean().item()
             if stage_label_probs is not None:
                 stage_loss_per_sample = soft_target_cross_entropy(
                     stage_outputs["stage_logits"], stage_label_probs
                 )
-                loss_dict["stage_loss"] = stage_loss_per_sample.mean().item()
-                loss_dict["stage_loss_weighted"] = (
-                    self.config.stage_loss_weight * stage_loss_per_sample.mean().item()
-                )
-            else:
-                loss_dict["stage_loss"] = 0.0
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
-        loss_dict["losses_after_forward"] = losses.clone().mean().item()
 
         if actions_is_pad is not None:
             in_episode_bound = ~actions_is_pad
             losses = losses * in_episode_bound.unsqueeze(-1)
-            loss_dict["losses_after_in_ep_bound"] = losses.clone().mean().item()
 
         # Remove padding
         losses = losses[:, :, : self.config.max_action_dim]
-        loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
         fm_loss_per_sample = losses.mean(dim=(1, 2))
         l_large_per_sample = None
         l_small_per_sample = None
         action_multiscale_per_sample = None
-        z_cond_for_logging = None
-        if model_outputs is not None and model_outputs.get("z_cond") is not None:
-            z_cond_for_logging = model_outputs["z_cond"]
-        elif stage_label_probs is not None:
-            z_hat_for_logging = stage_outputs["stage_probs"] if stage_outputs is not None else None
-            z_cond_for_logging = self.blend_stage_condition(stage_label_probs, z_hat_for_logging, alpha)
-
-        if z_cond_for_logging is not None:
-            loss_dict["zcond_p_global_mean"] = z_cond_for_logging[:, 0].mean().item()
 
         if (
             self.config.use_stage_conditioned_action
@@ -716,9 +709,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
             and model_outputs.get("l_small_elementwise") is not None
         ):
             z_cond = model_outputs["z_cond"]
-            loss_dict["z_cond_mean_global"] = z_cond[:, 0].mean().item()
-            loss_dict["z_cond_mean_local"] = z_cond[:, 1].mean().item()
-
             l_large_elementwise = model_outputs["l_large_elementwise"][:, :, :original_action_dim]
             l_small_elementwise = model_outputs["l_small_elementwise"][:, :, :original_action_dim]
             if actions_is_pad is not None:
@@ -756,28 +746,20 @@ class SmolVLAPolicy(PreTrainedPolicy):
             action_loss_per_sample,
             total_loss_per_sample,
         )
-        loss_dict["l_fm"] = fm_loss_per_sample.mean().item()
-        loss_dict["l_action"] = (
-            action_multiscale_per_sample.mean().item()
-            if action_multiscale_per_sample is not None
-            else 0.0
+        if stage_loss_per_sample is not None:
+            stage_loss_value = stage_loss_per_sample.mean().item()
+        l_stage_value = stage_loss_value
+        loss_dict = self._build_train_log_dict(
+            alpha=alpha,
+            stage_loss=stage_loss_value,
+            stage_agreement=stage_agreement_value,
+            l_stage=l_stage_value,
         )
-        loss_dict["l_large"] = l_large_per_sample.mean().item() if l_large_per_sample is not None else 0.0
-        loss_dict["l_small"] = l_small_per_sample.mean().item() if l_small_per_sample is not None else 0.0
-        loss_dict["action_loss"] = action_loss_per_sample.mean().item()
-        loss_dict["l_stage"] = stage_loss_per_sample.mean().item() if stage_loss_per_sample is not None else 0.0
-        loss_dict["total_loss"] = total_loss_per_sample.mean().item()
 
         if reduction == "none":
-            if self.training:
-                self.update()
-            loss_dict["loss"] = total_loss_per_sample.mean().item()
             return total_loss_per_sample, loss_dict
         else:
             loss = total_loss_per_sample.mean()
-            if self.training:
-                self.update()
-            loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
     def prepare_images(self, batch):
