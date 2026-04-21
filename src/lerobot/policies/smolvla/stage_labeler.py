@@ -16,28 +16,33 @@
 
 """Stage labeler for SmolVLA future action chunks.
 
-This module models the latent stage variable ``z_t`` as a chunk-level option
-posterior inferred only from the future action chunk ``A_t``. The model does
-not consume images or robot state.
+This module augments the future-action stage labeler with a multimodal
+conditioning branch that encodes:
 
-The implementation follows a two-expert design:
+1. image observations ``ob.i`` with a frozen SmolVLM vision encoder,
+2. robot state ``ob.s`` with a small trainable MLP,
+3. task tokens with a frozen SmolVLM text encoder,
 
-1. A coarse expert reconstructs the chunk from a small set of learned anchors
-   expanded by fixed piecewise-linear interpolation.
-2. A residual expert predicts a learned residual that refines the coarse chunk.
-
-The final reconstruction is mixed by a two-way posterior over ``global`` and
-``local`` options. The output dataclass exposes both reconstructions and the
-individual diagnostic losses needed during training.
+then fuses them into a conditioning vector ``et``. The pooled action
+representation is modulated by ``et`` through FiLM before the downstream
+mixture, coarse-anchor, and residual heads.
 """
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
+
+try:
+    from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+    from lerobot.policies.smolvla.smolvlm_with_expert import SmolVLMWithExpertModel
+except ModuleNotFoundError:
+    from configuration_smolvla import SmolVLAConfig
+    from smolvlm_with_expert import SmolVLMWithExpertModel
 
 
 @dataclass(slots=True)
@@ -61,6 +66,17 @@ class StageLabelerConfig:
         min_anchor_spacing_ratio: Minimum adjacent spacing, expressed as a
             fraction of the uniform spacing ``(H - 1) / (K - 1)``.
         eps: Numerical epsilon used in divisions and logarithms.
+        condition_hidden_dim: Output width of the fused conditioning vector.
+        state_hidden_dim: Hidden width of the robot-state encoder MLP.
+        freeze_condition_encoders: Whether the SmolVLM image/text encoders stay
+            frozen and in eval mode.
+        vlm_model_name: SmolVLM checkpoint used for image/text encoding.
+        image_proj_dim: Projected width of the pooled image feature.
+        text_proj_dim: Projected width of the pooled text feature.
+        film_hidden_dim: Hidden width of the FiLM MLP that modulates the
+            action chunk representation.
+        use_condition_film: Whether to apply FiLM modulation when a condition
+            embedding is available.
     """
 
     chunk_size: int
@@ -77,6 +93,14 @@ class StageLabelerConfig:
     target_probs: tuple[float, float] = (0.5, 0.5)
     min_anchor_spacing_ratio: float = 0.5
     eps: float = 1e-8
+    condition_hidden_dim: int = 256
+    state_hidden_dim: int = 256
+    freeze_condition_encoders: bool = True
+    vlm_model_name: str = SmolVLAConfig.vlm_model_name
+    image_proj_dim: int | None = None
+    text_proj_dim: int | None = None
+    film_hidden_dim: int = 256
+    use_condition_film: bool = True
 
     def __post_init__(self) -> None:
         if self.chunk_size <= 1:
@@ -119,9 +143,25 @@ class StageLabelerConfig:
             )
         if self.eps <= 0.0:
             raise ValueError(f"`eps` must be positive, got {self.eps}.")
+        if self.condition_hidden_dim <= 0:
+            raise ValueError(
+                f"`condition_hidden_dim` must be positive, got {self.condition_hidden_dim}."
+            )
+        if self.state_hidden_dim <= 0:
+            raise ValueError(f"`state_hidden_dim` must be positive, got {self.state_hidden_dim}.")
+        if self.image_proj_dim is not None and self.image_proj_dim <= 0:
+            raise ValueError(f"`image_proj_dim` must be positive, got {self.image_proj_dim}.")
+        if self.text_proj_dim is not None and self.text_proj_dim <= 0:
+            raise ValueError(f"`text_proj_dim` must be positive, got {self.text_proj_dim}.")
+        if self.film_hidden_dim <= 0:
+            raise ValueError(f"`film_hidden_dim` must be positive, got {self.film_hidden_dim}.")
 
         normalized_probs = tuple(prob / target_probs_sum for prob in self.target_probs)
         object.__setattr__(self, "target_probs", normalized_probs)
+        if self.image_proj_dim is None:
+            object.__setattr__(self, "image_proj_dim", self.condition_hidden_dim)
+        if self.text_proj_dim is None:
+            object.__setattr__(self, "text_proj_dim", self.condition_hidden_dim)
 
 
 @dataclass(slots=True)
@@ -169,6 +209,11 @@ class StageLabelerOutput:
     residual_chunk: Tensor
     refined_chunk: Tensor
     mixed_chunk: Tensor
+    image_embedding: Tensor | None = None
+    state_embedding: Tensor | None = None
+    text_embedding: Tensor | None = None
+    condition_embedding: Tensor | None = None
+    conditioned_chunk: Tensor | None = None
 
 
 class ChunkEncoder1D(nn.Module):
@@ -204,16 +249,7 @@ class ChunkEncoder1D(nn.Module):
         )
 
     def forward(self, action_chunk: Tensor, action_is_pad: Tensor | None = None) -> Tensor:
-        """Encode an action chunk into a single chunk-level representation.
-
-        Args:
-            action_chunk: Tensor of shape ``[B, H, D]``.
-            action_is_pad: Optional padding mask of shape ``[B, H]`` where
-                ``True`` marks padded action steps.
-
-        Returns:
-            Tensor of shape ``[B, hidden_dim]``.
-        """
+        """Encode an action chunk into a single chunk-level representation."""
 
         if action_chunk.ndim != 3:
             raise ValueError(
@@ -249,16 +285,6 @@ class MixtureHead(nn.Module):
         )
 
     def forward(self, encoded_chunk: Tensor) -> tuple[Tensor, Tensor]:
-        """Return mixture logits and probabilities.
-
-        Args:
-            encoded_chunk: Chunk representation of shape ``[B, hidden_dim]``.
-
-        Returns:
-            Tuple ``(logits, probs)`` where both tensors have shape ``[B, 2]``.
-            Index 0 is ``p_global`` and index 1 is ``p_local``.
-        """
-
         logits = self.proj(encoded_chunk)
         probs = torch.softmax(logits, dim=-1)
         return logits, probs
@@ -289,16 +315,6 @@ class CoarseAnchorDecoder(nn.Module):
         )
 
     def forward(self, encoded_chunk: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        """Decode anchors and interpolate them into a full coarse chunk.
-
-        Args:
-            encoded_chunk: Tensor of shape ``[B, hidden_dim]``.
-
-        Returns:
-            Tuple ``(coarse_chunk, anchor_values, anchor_positions)`` with
-            shapes ``[B, H, D]``, ``[B, K, D]`` and ``[B, K]``.
-        """
-
         batch_size = encoded_chunk.shape[0]
         anchor_values = self.anchor_value_head(encoded_chunk).view(
             batch_size, self.num_anchors, self.action_dim
@@ -313,16 +329,6 @@ class CoarseAnchorDecoder(nn.Module):
         return coarse_chunk, anchor_values, anchor_positions
 
     def spacing_loss(self, anchor_positions: Tensor) -> tuple[Tensor, Tensor]:
-        """Compute a penalty that discourages anchors from collapsing together.
-
-        Args:
-            anchor_positions: Sorted anchor positions of shape ``[B, K]``.
-
-        Returns:
-            Tuple ``(loss_per_sample, anchor_gaps)`` where ``anchor_gaps`` has
-            shape ``[B, K - 1]``.
-        """
-
         anchor_gaps = anchor_positions[:, 1:] - anchor_positions[:, :-1]
         uniform_gap = float(self.chunk_size - 1) / float(self.num_anchors - 1)
         minimum_gap = self.min_anchor_spacing_ratio * uniform_gap
@@ -375,20 +381,192 @@ class ResidualDecoder(nn.Module):
         )
 
     def forward(self, encoded_chunk: Tensor) -> Tensor:
-        """Decode the residual action chunk of shape ``[B, H, D]``."""
-
         batch_size = encoded_chunk.shape[0]
         residual = self.proj(encoded_chunk)
         return residual.view(batch_size, self.chunk_size, self.action_dim)
 
 
-class FutureChunkStageLabeler(nn.Module):
-    """Infer a chunk-level option posterior from future actions only.
+class FrozenConditionEncoder(nn.Module):
+    """Encode image and language inputs with a frozen SmolVLM backbone."""
 
-    The model encodes a future action chunk, predicts a two-way posterior over
-    global/local experts, reconstructs a coarse chunk from sparse anchors,
-    refines it with a learned residual, and optimizes the masked reconstruction
-    objective described in the module docstring.
+    def __init__(self, config: StageLabelerConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.vlm_with_expert = SmolVLMWithExpertModel(
+            model_id=config.vlm_model_name,
+            load_vlm_weights=True,
+            train_expert_only=True,
+            freeze_vision_encoder=True,
+        )
+        vlm_hidden_dim = int(self.vlm_with_expert.config.text_config.hidden_size)
+        self.image_proj = nn.Linear(vlm_hidden_dim, int(config.image_proj_dim))
+        self.text_proj = nn.Linear(vlm_hidden_dim, int(config.text_proj_dim))
+        self._configure_backbone_trainability()
+
+    def encode_image(self, obs_image: Tensor) -> Tensor:
+        if obs_image.ndim != 4:
+            raise ValueError(
+                f"`obs_image` must have shape [B, C, H, W], got {tuple(obs_image.shape)}."
+            )
+
+        with self._backbone_context():
+            image_tokens = self.vlm_with_expert.embed_image(obs_image)
+        image_feature = image_tokens.mean(dim=1)
+        image_feature = image_feature.to(dtype=self.image_proj.weight.dtype)
+        return self.image_proj(image_feature)
+
+    def encode_text(self, task_tokens: Tensor, task_mask: Tensor) -> Tensor:
+        if task_tokens.ndim != 2:
+            raise ValueError(
+                f"`task_tokens` must have shape [B, L], got {tuple(task_tokens.shape)}."
+            )
+        if task_mask.ndim != 2:
+            raise ValueError(
+                f"`task_mask` must have shape [B, L], got {tuple(task_mask.shape)}."
+            )
+        if task_tokens.shape != task_mask.shape:
+            raise ValueError(
+                "`task_tokens` and `task_mask` must have identical shapes, "
+                f"got {tuple(task_tokens.shape)} and {tuple(task_mask.shape)}."
+            )
+
+        text_model = self._get_text_backbone()
+        attention_mask = task_mask.to(device=task_tokens.device, dtype=torch.long)
+
+        with self._backbone_context():
+            lang_embeddings = self.vlm_with_expert.embed_language_tokens(task_tokens)
+            text_outputs = text_model(
+                inputs_embeds=lang_embeddings.to(dtype=self._get_text_dtype()),
+                attention_mask=attention_mask,
+                output_hidden_states=False,
+                return_dict=True,
+                use_cache=False,
+            )
+
+        hidden_states = text_outputs.last_hidden_state
+        mask = task_mask.to(device=hidden_states.device, dtype=hidden_states.dtype).unsqueeze(-1)
+        pooled_feature = (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        pooled_feature = pooled_feature.to(dtype=self.text_proj.weight.dtype)
+        return self.text_proj(pooled_feature)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.config.freeze_condition_encoders:
+            self.vlm_with_expert.eval()
+        return self
+
+    def _configure_backbone_trainability(self) -> None:
+        if self.config.freeze_condition_encoders:
+            for parameter in self.vlm_with_expert.parameters():
+                parameter.requires_grad = False
+            self.vlm_with_expert.eval()
+        else:
+            self.vlm_with_expert.freeze_vision_encoder = False
+            self.vlm_with_expert.train_expert_only = False
+            for parameter in self.vlm_with_expert.parameters():
+                parameter.requires_grad = True
+
+    def _backbone_context(self):
+        if self.config.freeze_condition_encoders:
+            return torch.inference_mode()
+        return nullcontext()
+
+    def _get_text_backbone(self):
+        text_model = self.vlm_with_expert.get_vlm_model().text_model
+        return getattr(text_model, "model", text_model)
+
+    def _get_text_dtype(self) -> torch.dtype:
+        text_backbone = self._get_text_backbone()
+        return next(text_backbone.parameters()).dtype
+
+
+class StateEncoder(nn.Module):
+    """Encode robot state with a small trainable MLP."""
+
+    def __init__(self, config: StageLabelerConfig) -> None:
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.LazyLinear(config.state_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.encoder_dropout),
+            nn.Linear(config.state_hidden_dim, config.condition_hidden_dim),
+        )
+
+    def forward(self, obs_state: Tensor) -> Tensor:
+        if obs_state.ndim == 3:
+            obs_state = obs_state[:, -1, :]
+        elif obs_state.ndim != 2:
+            raise ValueError(
+                f"`obs_state` must have shape [B, D] or [B, T, D], got {tuple(obs_state.shape)}."
+            )
+        return self.proj(obs_state.to(dtype=torch.float32))
+
+
+class ConditionFusionMLP(nn.Module):
+    """Fuse image/state/text features into a single condition embedding ``et``."""
+
+    def __init__(self, config: StageLabelerConfig) -> None:
+        super().__init__()
+        input_dim = int(config.image_proj_dim) + config.condition_hidden_dim + int(config.text_proj_dim)
+        self.proj = nn.Sequential(
+            nn.Linear(input_dim, config.condition_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.encoder_dropout),
+            nn.Linear(config.condition_hidden_dim, config.condition_hidden_dim),
+        )
+
+    def forward(self, image_embedding: Tensor, state_embedding: Tensor, text_embedding: Tensor) -> Tensor:
+        fused = torch.cat([image_embedding, state_embedding, text_embedding], dim=-1)
+        return self.proj(fused)
+
+
+class ConditionFiLM(nn.Module):
+    """Apply FiLM modulation to the pooled action embedding."""
+
+    def __init__(self, config: StageLabelerConfig) -> None:
+        super().__init__()
+        self.hidden = nn.Sequential(
+            nn.Linear(config.condition_hidden_dim, config.film_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.encoder_dropout),
+        )
+        self.gamma_head = nn.Linear(config.film_hidden_dim, config.encoder_hidden_dim)
+        self.beta_head = nn.Linear(config.film_hidden_dim, config.encoder_hidden_dim)
+        nn.init.normal_(self.gamma_head.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.gamma_head.bias)
+        nn.init.normal_(self.beta_head.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.beta_head.bias)
+
+    def forward(self, encoded_chunk: Tensor, condition_embedding: Tensor) -> Tensor:
+        if encoded_chunk.ndim != 2:
+            raise ValueError(
+                f"`encoded_chunk` must have shape [B, D], got {tuple(encoded_chunk.shape)}."
+            )
+        if condition_embedding.ndim != 2:
+            raise ValueError(
+                "`condition_embedding` must have shape [B, C], "
+                f"got {tuple(condition_embedding.shape)}."
+            )
+        if encoded_chunk.shape[0] != condition_embedding.shape[0]:
+            raise ValueError(
+                "FiLM inputs must share the same batch size, "
+                f"got {encoded_chunk.shape[0]} and {condition_embedding.shape[0]}."
+            )
+
+        hidden = self.hidden(condition_embedding)
+        gamma_delta = self.gamma_head(hidden)
+        beta = self.beta_head(hidden)
+        gamma = 1.0 + gamma_delta
+        return gamma * encoded_chunk + beta
+
+
+class FutureChunkStageLabeler(nn.Module):
+    """Infer a chunk-level option posterior from future actions.
+
+    The action encoder / decoders remain unchanged. A separate multimodal
+    branch computes image, state, and text features plus the fused condition
+    embedding ``et`` and injects it into the pooled action representation via
+    FiLM before the downstream heads.
     """
 
     def __init__(self, config: StageLabelerConfig) -> None:
@@ -398,6 +576,10 @@ class FutureChunkStageLabeler(nn.Module):
         self.mixture_head = MixtureHead(config)
         self.coarse_decoder = CoarseAnchorDecoder(config)
         self.residual_decoder = ResidualDecoder(config)
+        self.frozen_vlm_encoder = FrozenConditionEncoder(config)
+        self.state_encoder = StateEncoder(config)
+        self.condition_fusion = ConditionFusionMLP(config)
+        self.condition_film = ConditionFiLM(config)
         self.register_buffer(
             "target_probs",
             torch.tensor(config.target_probs, dtype=torch.float32),
@@ -407,29 +589,31 @@ class FutureChunkStageLabeler(nn.Module):
     def forward(
         self,
         action_chunk: torch.Tensor,
+        obs_image: torch.Tensor | None = None,
+        obs_state: torch.Tensor | None = None,
+        task_tokens: torch.Tensor | None = None,
+        task_mask: torch.Tensor | None = None,
         action_is_pad: torch.Tensor | None = None,
         reduction: str = "mean",
     ) -> StageLabelerOutput:
-        """Run the stage labeler and compute the training losses.
-
-        Args:
-            action_chunk: Future action chunk of shape ``[B, H, D]`` or
-                ``[H, D]``.
-            action_is_pad: Optional padding mask of shape ``[B, H]`` or ``[H]``
-                where ``True`` marks padded time steps.
-            reduction: Either ``"mean"`` or ``"none"``.
-
-        Returns:
-            A :class:`StageLabelerOutput` containing reconstructions, posterior
-            probabilities, anchor diagnostics, and all loss terms.
-        """
+        """Run the stage labeler and compute the training losses."""
 
         action_chunk, action_is_pad = self._prepare_inputs(action_chunk, action_is_pad)
+        image_embedding, state_embedding, text_embedding, condition_embedding = (
+            self._encode_conditioning_inputs(
+                obs_image=obs_image,
+                obs_state=obs_state,
+                task_tokens=task_tokens,
+                task_mask=task_mask,
+                batch_size=action_chunk.shape[0],
+            )
+        )
 
         encoded_chunk = self.encoder(action_chunk, action_is_pad=action_is_pad)
-        mixture_logits, stage_probs = self.mixture_head(encoded_chunk)
-        coarse_chunk, anchor_values, anchor_positions = self.coarse_decoder(encoded_chunk)
-        residual_chunk = self.residual_decoder(encoded_chunk)
+        conditioned_chunk = self._apply_condition_film(encoded_chunk, condition_embedding)
+        mixture_logits, stage_probs = self.mixture_head(conditioned_chunk)
+        coarse_chunk, anchor_values, anchor_positions = self.coarse_decoder(conditioned_chunk)
+        residual_chunk = self.residual_decoder(conditioned_chunk)
         refined_chunk = coarse_chunk + residual_chunk
 
         p_global = stage_probs[:, 0]
@@ -497,27 +681,101 @@ class FutureChunkStageLabeler(nn.Module):
             residual_chunk=residual_chunk,
             refined_chunk=refined_chunk,
             mixed_chunk=mixed_chunk,
+            image_embedding=image_embedding,
+            state_embedding=state_embedding,
+            text_embedding=text_embedding,
+            condition_embedding=condition_embedding,
+            conditioned_chunk=conditioned_chunk,
         )
 
     def predict_stage_probs(
-        self, action_chunk: torch.Tensor, action_is_pad: torch.Tensor | None = None
+        self,
+        action_chunk: torch.Tensor,
+        obs_image: torch.Tensor | None = None,
+        obs_state: torch.Tensor | None = None,
+        task_tokens: torch.Tensor | None = None,
+        task_mask: torch.Tensor | None = None,
+        action_is_pad: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Predict stage posterior probabilities without computing losses.
-
-        Args:
-            action_chunk: Future action chunk of shape ``[B, H, D]`` or
-                ``[H, D]``.
-            action_is_pad: Optional padding mask of shape ``[B, H]`` or ``[H]``.
-
-        Returns:
-            Mixture probabilities of shape ``[B, 2]`` with index 0 equal to
-            ``p_global`` and index 1 equal to ``p_local``.
-        """
+        """Predict stage posterior probabilities without computing losses."""
 
         action_chunk, action_is_pad = self._prepare_inputs(action_chunk, action_is_pad)
+        _, _, _, condition_embedding = self._encode_conditioning_inputs(
+            obs_image=obs_image,
+            obs_state=obs_state,
+            task_tokens=task_tokens,
+            task_mask=task_mask,
+            batch_size=action_chunk.shape[0],
+        )
         encoded_chunk = self.encoder(action_chunk, action_is_pad=action_is_pad)
-        _, stage_probs = self.mixture_head(encoded_chunk)
+        conditioned_chunk = self._apply_condition_film(encoded_chunk, condition_embedding)
+        _, stage_probs = self.mixture_head(conditioned_chunk)
         return stage_probs
+
+    def _encode_conditioning_inputs(
+        self,
+        *,
+        obs_image: Tensor | None,
+        obs_state: Tensor | None,
+        task_tokens: Tensor | None,
+        task_mask: Tensor | None,
+        batch_size: int,
+    ) -> tuple[Tensor | None, Tensor | None, Tensor | None, Tensor | None]:
+        provided = {
+            "obs_image": obs_image,
+            "obs_state": obs_state,
+            "task_tokens": task_tokens,
+            "task_mask": task_mask,
+        }
+        if all(value is None for value in provided.values()):
+            return None, None, None, None
+        if any(value is None for value in provided.values()):
+            missing = [key for key, value in provided.items() if value is None]
+            raise ValueError(
+                "Conditioning inputs must either all be provided or all be omitted. "
+                f"Missing: {missing}."
+            )
+
+        assert obs_image is not None
+        assert obs_state is not None
+        assert task_tokens is not None
+        assert task_mask is not None
+
+        if obs_image.shape[0] != batch_size:
+            raise ValueError(
+                f"`obs_image` batch size {obs_image.shape[0]} does not match action batch {batch_size}."
+            )
+        if obs_state.shape[0] != batch_size:
+            raise ValueError(
+                f"`obs_state` batch size {obs_state.shape[0]} does not match action batch {batch_size}."
+            )
+        if task_tokens.shape[0] != batch_size or task_mask.shape[0] != batch_size:
+            raise ValueError(
+                "Text conditioning batch size must match the action batch. "
+                f"Got task_tokens={task_tokens.shape[0]} task_mask={task_mask.shape[0]} batch={batch_size}."
+            )
+
+        image_embedding = self.frozen_vlm_encoder.encode_image(obs_image)
+        text_embedding = self.frozen_vlm_encoder.encode_text(task_tokens, task_mask)
+        state_embedding = self.state_encoder(obs_state)
+        condition_embedding = self.condition_fusion(
+            image_embedding=image_embedding,
+            state_embedding=state_embedding,
+            text_embedding=text_embedding,
+        )
+        return image_embedding, state_embedding, text_embedding, condition_embedding
+
+    def _apply_condition_film(
+        self, encoded_chunk: Tensor, condition_embedding: Tensor | None
+    ) -> Tensor:
+        if condition_embedding is None or not self.config.use_condition_film:
+            return encoded_chunk
+
+        condition_embedding = condition_embedding.to(
+            device=encoded_chunk.device,
+            dtype=encoded_chunk.dtype,
+        )
+        return self.condition_film(encoded_chunk, condition_embedding)
 
     def _prepare_inputs(
         self, action_chunk: Tensor, action_is_pad: Tensor | None
