@@ -1143,14 +1143,18 @@ class VLAFlowMatching(nn.Module):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         # Compute image and language key value cache
-        _, past_key_values = self.vlm_with_expert.forward(
+        prefix_outputs = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
+            prefix_pad_masks=prefix_pad_masks,
+            return_prefix_state_token=self.config.enable_action_component_branch,
         )
+        self.cached_prefix_state_token = prefix_outputs.prefix_state_token
+        past_key_values = prefix_outputs.past_key_values
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
 
@@ -1199,6 +1203,13 @@ class VLAFlowMatching(nn.Module):
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
+        if (
+            self.config.enable_action_component_branch
+            and self.config.enable_suffix_component_film
+            and self.cached_prefix_state_token is not None
+        ):
+            z_hat = self.component_predictor(self.cached_prefix_state_token)
+            suffix_embs = self.apply_suffix_component_film(suffix_embs, z_hat)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -1211,7 +1222,7 @@ class VLAFlowMatching(nn.Module):
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-        outputs_embeds, _ = self.vlm_with_expert.forward(
+        outputs = self.vlm_with_expert.forward(
             attention_mask=full_att_2d_masks,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -1219,7 +1230,7 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=False,
         )
-        suffix_out = outputs_embeds[1]
+        suffix_out = outputs.outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)

@@ -218,10 +218,11 @@ class DummySmolVLM(nn.Module):
         return_prefix_state_token=False,
     ):
         prefix, suffix = inputs_embeds
+        ref = prefix if prefix is not None else suffix
         suffix_hidden = None
         if suffix is not None:
             suffix_hidden = torch.zeros(
-                prefix.shape[0], suffix.shape[1], self.expert_hidden_size, device=prefix.device
+                ref.shape[0], suffix.shape[1], self.expert_hidden_size, device=ref.device
             )
         prefix_state_token = (
             extract_prefix_state_token(prefix, prefix_pad_masks) if return_prefix_state_token else None
@@ -295,3 +296,36 @@ def test_smolvla_forward_reduction_none_keeps_per_sample_loss(monkeypatch):
     assert losses.shape == (2,)
     assert torch.isfinite(losses).all()
     assert loss_dict["loss"] == pytest.approx(losses.mean().item())
+
+
+def test_smolvla_denoise_step_uses_z_hat_without_decomposition(monkeypatch):
+    policy = make_component_policy(monkeypatch)
+    policy.model.cached_prefix_state_token = torch.randn(2, 8)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("decomposition branch must not run during inference")
+
+    film_calls = {"count": 0}
+
+    def film_spy(components):
+        film_calls["count"] += 1
+        return torch.zeros(components.shape[0], 1, 6), torch.zeros(components.shape[0], 1, 6)
+
+    policy.model.action_decomposition_head.forward = fail_if_called
+    policy.model.suffix_component_film.forward = film_spy
+
+    prefix_pad_masks = torch.ones(2, 3, dtype=torch.bool)
+    past_key_values = {}
+    x_t = torch.randn(2, 5, 3)
+    timestep = torch.full((2,), 0.5, dtype=torch.float32)
+
+    v_t = policy.model.denoise_step(
+        prefix_pad_masks=prefix_pad_masks,
+        past_key_values=past_key_values,
+        x_t=x_t,
+        timestep=timestep,
+    )
+
+    assert film_calls["count"] == 1
+    assert v_t.shape == (2, 5, 3)
+    assert torch.isfinite(v_t).all()
