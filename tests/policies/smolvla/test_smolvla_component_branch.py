@@ -19,6 +19,11 @@ import torch
 
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.modeling_smolvla import (
+    ActionChunkEncoder,
+    ActionComponentDecompositionHead,
+    ComponentPredictor,
+    FiLMConditioner,
+    SuffixComponentFiLM,
     build_lowpass_target,
     compute_component_regularization_losses,
     compute_component_teacher_weight,
@@ -134,3 +139,47 @@ def test_smolvlm_forward_output_keeps_optional_prefix_state_token():
     )
 
     assert output.prefix_state_token.shape == (1, 4)
+
+
+def test_action_component_modules_produce_chunk_level_outputs():
+    batch_size = 2
+    chunk_size = 5
+    action_dim = 3
+    hidden_dim = 8
+    num_anchors = 3
+
+    encoder = ActionChunkEncoder(
+        action_dim=action_dim,
+        hidden_dim=hidden_dim,
+        kernel_size=3,
+        pooling="mean",
+    )
+    film = FiLMConditioner(context_dim=6, target_dim=hidden_dim, hidden_dim=10)
+    head = ActionComponentDecompositionHead(
+        hidden_dim=hidden_dim,
+        action_dim=action_dim,
+        chunk_size=chunk_size,
+        num_anchors=num_anchors,
+    )
+    predictor = ComponentPredictor(context_dim=6, hidden_dim=10)
+    suffix_film = SuffixComponentFiLM(component_dim=2, hidden_dim=12, target_dim=7)
+
+    actions = torch.randn(batch_size, chunk_size, action_dim)
+    context = torch.randn(batch_size, 6)
+
+    encoded = encoder(actions)
+    conditioned = film(encoded, context)
+    outputs = head(conditioned)
+    z_hat = predictor(context)
+    gamma, beta = suffix_film(z_hat)
+
+    assert encoded.shape == (batch_size, hidden_dim)
+    assert conditioned.shape == (batch_size, hidden_dim)
+    assert outputs["gates"].shape == (batch_size, 2)
+    assert outputs["anchor_values"].shape == (batch_size, num_anchors, action_dim)
+    assert outputs["trend"].shape == (batch_size, chunk_size, action_dim)
+    assert outputs["refined"].shape == (batch_size, chunk_size, action_dim)
+    assert outputs["reconstruction"].shape == (batch_size, chunk_size, action_dim)
+    assert z_hat.shape == (batch_size, 2)
+    assert gamma.shape == (batch_size, 1, 7)
+    assert beta.shape == (batch_size, 1, 7)

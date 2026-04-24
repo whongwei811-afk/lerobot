@@ -265,6 +265,94 @@ def compute_component_regularization_losses(
     }
 
 
+class ActionChunkEncoder(nn.Module):
+    def __init__(self, action_dim: int, hidden_dim: int, kernel_size: int, pooling: str):
+        super().__init__()
+        self.in_proj = nn.Linear(action_dim, hidden_dim)
+        self.temporal_conv = nn.Conv1d(
+            hidden_dim, hidden_dim, kernel_size, padding=kernel_size // 2
+        )
+        self.pooling = pooling
+
+    def forward(self, actions: Tensor) -> Tensor:
+        hidden = self.in_proj(actions)
+        hidden = self.temporal_conv(hidden.transpose(1, 2)).transpose(1, 2)
+        if self.pooling == "mean":
+            return hidden.mean(dim=1)
+        return hidden.max(dim=1).values
+
+
+class FiLMConditioner(nn.Module):
+    def __init__(self, context_dim: int, target_dim: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(context_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, target_dim * 2),
+        )
+
+    def forward(self, target: Tensor, context: Tensor) -> Tensor:
+        gamma, beta = self.net(context).chunk(2, dim=-1)
+        return (1.0 + gamma) * target + beta
+
+
+class ActionComponentDecompositionHead(nn.Module):
+    def __init__(self, hidden_dim: int, action_dim: int, chunk_size: int, num_anchors: int):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.action_dim = action_dim
+        self.num_anchors = num_anchors
+
+        self.gate_head = nn.Linear(hidden_dim, 2)
+        self.anchor_head = nn.Linear(hidden_dim, num_anchors * action_dim)
+        self.refined_head = nn.Linear(hidden_dim, chunk_size * action_dim)
+        self.anchor_positions = nn.Parameter(torch.linspace(0.0, 1.0, num_anchors))
+
+    def forward(self, hidden: Tensor) -> dict[str, Tensor]:
+        gates = self.gate_head(hidden).softmax(dim=-1)
+        anchor_values = self.anchor_head(hidden).view(hidden.shape[0], self.num_anchors, self.action_dim)
+        trend = interpolate_trend_from_anchors(anchor_values, self.anchor_positions, self.chunk_size)
+        refined = self.refined_head(hidden).view(hidden.shape[0], self.chunk_size, self.action_dim)
+
+        trend_weight = gates[:, 0].view(-1, 1, 1)
+        refined_weight = gates[:, 1].view(-1, 1, 1)
+        reconstruction = trend_weight * trend + refined_weight * refined
+        return {
+            "gates": gates,
+            "anchor_values": anchor_values,
+            "trend": trend,
+            "refined": refined,
+            "reconstruction": reconstruction,
+        }
+
+
+class ComponentPredictor(nn.Module):
+    def __init__(self, context_dim: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(context_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2),
+        )
+
+    def forward(self, context: Tensor) -> Tensor:
+        return self.net(context).softmax(dim=-1)
+
+
+class SuffixComponentFiLM(nn.Module):
+    def __init__(self, component_dim: int, hidden_dim: int, target_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(component_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, target_dim * 2),
+        )
+
+    def forward(self, components: Tensor) -> tuple[Tensor, Tensor]:
+        gamma, beta = self.net(components).chunk(2, dim=-1)
+        return gamma[:, None, :], beta[:, None, :]
+
+
 def normalize(x, min_val, max_val):
     return (x - min_val) / (max_val - min_val)
 
