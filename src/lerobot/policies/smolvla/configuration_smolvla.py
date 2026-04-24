@@ -106,6 +106,32 @@ class SmolVLAConfig(PreTrainedConfig):
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
 
+    # Action-component branch
+    enable_action_component_branch: bool = False
+    enable_suffix_component_film: bool = False
+
+    component_hidden_dim: int = 256
+    component_conv_kernel_size: int = 3
+    component_pooling: str = "mean"
+    component_num_anchors: int = 4
+    component_predictor_hidden_dim: int = 128
+    suffix_component_film_hidden_dim: int = 128
+
+    component_anchor_position_temperature: float = 0.25
+    component_anchor_min_separation: float = 0.0
+
+    component_teacher_min_weight: float = 0.1
+    component_teacher_warmup_ratio: float = 0.1
+    component_teacher_decay_ratio: float = 0.7
+
+    loss_weight_recon: float = 0.25
+    loss_weight_comp: float = 0.05
+    loss_weight_reg_gate_entropy: float = 0.002
+    loss_weight_reg_gate_balance: float = 0.02
+    loss_weight_reg_trend_prior: float = 0.10
+    loss_weight_reg_ref_mag: float = 0.0005
+    loss_weight_reg_ref_center: float = 0.001
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -119,6 +145,17 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+        if self.enable_action_component_branch:
+            if self.component_num_anchors < 2:
+                raise ValueError("component_num_anchors must be >= 2")
+            if not 0.0 <= self.component_teacher_min_weight <= 1.0:
+                raise ValueError("component_teacher_min_weight must be in [0, 1]")
+            if self.component_teacher_warmup_ratio + self.component_teacher_decay_ratio > 1.0:
+                raise ValueError(
+                    "component_teacher_warmup_ratio + component_teacher_decay_ratio must be <= 1"
+                )
+            if self.chunk_size < self.component_num_anchors:
+                raise ValueError("chunk_size must be >= component_num_anchors")
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):
