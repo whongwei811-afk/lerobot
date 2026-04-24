@@ -16,8 +16,12 @@
 
 import pytest
 import torch
+from types import SimpleNamespace
+from torch import nn
 
+from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.policies.smolvla.modeling_smolvla import (
     ActionChunkEncoder,
     ActionComponentDecompositionHead,
@@ -34,6 +38,7 @@ from lerobot.policies.smolvla.smolvlm_with_expert import (
     SmolVLMForwardOutput,
     extract_prefix_state_token,
 )
+from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 
 
 def test_component_config_defaults_keep_feature_disabled():
@@ -183,3 +188,110 @@ def test_action_component_modules_produce_chunk_level_outputs():
     assert z_hat.shape == (batch_size, 2)
     assert gamma.shape == (batch_size, 1, 7)
     assert beta.shape == (batch_size, 1, 7)
+
+
+class DummySmolVLM(nn.Module):
+    def __init__(self, text_hidden_size: int, expert_hidden_size: int):
+        super().__init__()
+        self.config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=text_hidden_size))
+        self.expert_hidden_size = expert_hidden_size
+        self.processor = SimpleNamespace(
+            tokenizer=SimpleNamespace(fake_image_token_id=0, global_image_token_id=1)
+        )
+        self.vlm = SimpleNamespace(device=torch.device("cpu"))
+
+    def embed_language_tokens(self, tokens):
+        return torch.zeros(tokens.shape[0], tokens.shape[1], self.config.text_config.hidden_size)
+
+    def embed_image(self, image):
+        return torch.zeros(image.shape[0], 2, self.config.text_config.hidden_size)
+
+    def forward(
+        self,
+        attention_mask,
+        position_ids,
+        past_key_values,
+        inputs_embeds,
+        use_cache,
+        fill_kv_cache,
+        prefix_pad_masks=None,
+        return_prefix_state_token=False,
+    ):
+        prefix, suffix = inputs_embeds
+        suffix_hidden = None
+        if suffix is not None:
+            suffix_hidden = torch.zeros(
+                prefix.shape[0], suffix.shape[1], self.expert_hidden_size, device=prefix.device
+            )
+        prefix_state_token = (
+            extract_prefix_state_token(prefix, prefix_pad_masks) if return_prefix_state_token else None
+        )
+        return SmolVLMForwardOutput(
+            outputs_embeds=[prefix, suffix_hidden],
+            past_key_values={},
+            prefix_state_token=prefix_state_token,
+        )
+
+
+def make_component_policy(monkeypatch):
+    monkeypatch.setattr(
+        "lerobot.policies.smolvla.modeling_smolvla.require_package",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "lerobot.policies.smolvla.modeling_smolvla.SmolVLMWithExpertModel",
+        lambda *args, **kwargs: DummySmolVLM(text_hidden_size=8, expert_hidden_size=6),
+    )
+    config = SmolVLAConfig(
+        max_state_dim=4,
+        max_action_dim=3,
+        chunk_size=5,
+        n_action_steps=5,
+        enable_action_component_branch=True,
+        enable_suffix_component_film=True,
+        component_hidden_dim=8,
+        component_predictor_hidden_dim=8,
+        suffix_component_film_hidden_dim=8,
+    )
+    config.input_features = {
+        "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(4,)),
+        "observation.images.base_0_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 8, 8)),
+    }
+    config.output_features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(3,))}
+    return SmolVLAPolicy(config)
+
+
+def test_smolvla_forward_reports_grouped_component_losses(monkeypatch):
+    policy = make_component_policy(monkeypatch)
+    batch = {
+        OBS_STATE: torch.randn(2, 4),
+        "observation.images.base_0_rgb": torch.rand(2, 3, 8, 8),
+        OBS_LANGUAGE_TOKENS: torch.ones(2, 3, dtype=torch.long),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.ones(2, 3, dtype=torch.bool),
+        ACTION: torch.randn(2, 5, 3),
+        "action_is_pad": torch.tensor([[False, False, False, False, True], [False, False, False, False, False]]),
+    }
+
+    loss, loss_dict = policy.forward(batch, reduction="mean")
+
+    assert torch.isfinite(loss)
+    assert {"loss_flow", "loss_recon", "loss_comp", "loss_reg"} <= set(loss_dict)
+    assert {"loss_reg_gate_entropy", "loss_reg_gate_balance", "loss_reg_trend_prior"} <= set(loss_dict)
+
+
+def test_smolvla_forward_reduction_none_keeps_per_sample_loss(monkeypatch):
+    policy = make_component_policy(monkeypatch)
+    batch = {
+        OBS_STATE: torch.randn(2, 4),
+        "observation.images.base_0_rgb": torch.rand(2, 3, 8, 8),
+        OBS_LANGUAGE_TOKENS: torch.ones(2, 3, dtype=torch.long),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.ones(2, 3, dtype=torch.bool),
+        ACTION: torch.randn(2, 5, 3),
+        "action_is_pad": torch.zeros(2, 5, dtype=torch.bool),
+    }
+
+    losses, loss_dict = policy.forward(batch, reduction="none")
+
+    assert losses.shape == (2,)
+    assert torch.isfinite(losses).all()
+    assert loss_dict["loss"] == pytest.approx(losses.mean().item())
