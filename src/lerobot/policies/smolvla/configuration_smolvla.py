@@ -118,11 +118,12 @@ class SmolVLAConfig(PreTrainedConfig):
     suffix_component_film_hidden_dim: int = 128
 
     component_anchor_position_temperature: float = 0.25
-    component_anchor_min_separation: float = 0.0
+    component_anchor_min_separation: float = 0.05
 
     component_teacher_min_weight: float = 0.1
     component_teacher_warmup_ratio: float = 0.1
     component_teacher_decay_ratio: float = 0.7
+    component_teacher_schedule_steps: int | None = None
 
     loss_weight_recon: float = 0.25
     loss_weight_comp: float = 0.05
@@ -146,14 +147,30 @@ class SmolVLAConfig(PreTrainedConfig):
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
         if self.enable_action_component_branch:
+            if self.component_pooling not in {"mean", "max"}:
+                raise ValueError("component_pooling must be one of {'mean', 'max'}")
+            if self.component_conv_kernel_size < 1 or self.component_conv_kernel_size % 2 == 0:
+                raise ValueError("component_conv_kernel_size must be a positive odd integer")
             if self.component_num_anchors < 2:
                 raise ValueError("component_num_anchors must be >= 2")
             if not 0.0 <= self.component_teacher_min_weight <= 1.0:
                 raise ValueError("component_teacher_min_weight must be in [0, 1]")
+            if self.component_teacher_warmup_ratio < 0.0:
+                raise ValueError("component_teacher_warmup_ratio must be >= 0")
+            if self.component_teacher_decay_ratio < 0.0:
+                raise ValueError("component_teacher_decay_ratio must be >= 0")
             if self.component_teacher_warmup_ratio + self.component_teacher_decay_ratio > 1.0:
                 raise ValueError(
                     "component_teacher_warmup_ratio + component_teacher_decay_ratio must be <= 1"
                 )
+            if self.component_teacher_schedule_steps is not None and self.component_teacher_schedule_steps <= 0:
+                raise ValueError("component_teacher_schedule_steps must be > 0 when set")
+            if self.component_anchor_position_temperature <= 0.0:
+                raise ValueError("component_anchor_position_temperature must be > 0")
+            if self.component_anchor_min_separation < 0.0:
+                raise ValueError("component_anchor_min_separation must be >= 0")
+            if self.component_anchor_min_separation * (self.component_num_anchors - 1) > 1.0:
+                raise ValueError("component_anchor_min_separation is too large for component_num_anchors")
             if self.chunk_size < self.component_num_anchors:
                 raise ValueError("chunk_size must be >= component_num_anchors")
 

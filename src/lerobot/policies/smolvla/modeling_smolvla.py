@@ -54,15 +54,24 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 import math
 from collections import deque
+from pathlib import Path
 from typing import TypedDict, Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
-from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+from lerobot.utils.constants import (
+    ACTION,
+    OBS_LANGUAGE_ATTENTION_MASK,
+    OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
+    TRAINING_STATE_DIR,
+    TRAINING_STEP,
+)
 from lerobot.utils.device_utils import get_safe_dtype
 from lerobot.utils.import_utils import require_package
+from lerobot.utils.io_utils import load_json
 
 from ..pretrained import PreTrainedPolicy
 from ..rtc.modeling_rtc import RTCProcessor
@@ -77,6 +86,43 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+
+
+TRAIN_CONFIG_NAME = "train_config.json"
+
+
+def infer_component_teacher_schedule_steps_from_pretrained_path(
+    pretrained_path: str | Path | None,
+) -> int | None:
+    if pretrained_path is None:
+        return None
+
+    train_config_path = Path(pretrained_path) / TRAIN_CONFIG_NAME
+    if not train_config_path.is_file():
+        return None
+
+    train_config = load_json(train_config_path)
+    steps = train_config.get("steps")
+    if isinstance(steps, int) and steps > 0:
+        return steps
+    return None
+
+
+def infer_component_schedule_step_from_pretrained_path(
+    pretrained_path: str | Path | None,
+) -> int | None:
+    if pretrained_path is None:
+        return None
+
+    training_step_path = Path(pretrained_path).parent / TRAINING_STATE_DIR / TRAINING_STEP
+    if not training_step_path.is_file():
+        return None
+
+    training_state = load_json(training_step_path)
+    step = training_state.get("step")
+    if isinstance(step, int) and step > 0:
+        return step
+    return None
 
 
 def create_sinusoidal_pos_embedding(
@@ -215,9 +261,20 @@ def interpolate_trend_from_anchors(anchor_values: Tensor, anchor_positions: Tens
     return left_values + alpha * (right_values - left_values)
 
 
-def build_lowpass_target(actions: Tensor, anchor_positions: Tensor) -> Tensor:
-    idx = torch.round(anchor_positions * (actions.shape[1] - 1)).long().clamp(0, actions.shape[1] - 1)
-    anchor_values = actions[:, idx, :]
+def build_lowpass_target(
+    actions: Tensor,
+    anchor_positions: Tensor,
+    action_is_pad: Tensor | None = None,
+) -> Tensor:
+    if action_is_pad is None:
+        idx = torch.round(anchor_positions * (actions.shape[1] - 1)).long().clamp(0, actions.shape[1] - 1)
+        anchor_values = actions[:, idx, :]
+    else:
+        valid_steps = (~action_is_pad).sum(dim=1).clamp_min(1)
+        last_valid_idx = (valid_steps - 1).to(dtype=anchor_positions.dtype).unsqueeze(1)
+        idx = torch.round(anchor_positions.unsqueeze(0) * last_valid_idx).long().clamp(0, actions.shape[1] - 1)
+        gather_idx = idx.unsqueeze(-1).expand(-1, -1, actions.shape[-1])
+        anchor_values = actions.gather(1, gather_idx)
     return interpolate_trend_from_anchors(anchor_values, anchor_positions, actions.shape[1])
 
 
@@ -274,9 +331,19 @@ class ActionChunkEncoder(nn.Module):
         )
         self.pooling = pooling
 
-    def forward(self, actions: Tensor) -> Tensor:
+    def forward(self, actions: Tensor, action_is_pad: Tensor | None = None) -> Tensor:
         hidden = self.in_proj(actions)
         hidden = self.temporal_conv(hidden.transpose(1, 2)).transpose(1, 2)
+        if action_is_pad is not None:
+            valid_mask = (~action_is_pad).unsqueeze(-1)
+            valid_mask_f = valid_mask.to(dtype=hidden.dtype)
+            if self.pooling == "mean":
+                valid_count = valid_mask_f.sum(dim=1).clamp_min(1.0)
+                return (hidden * valid_mask_f).sum(dim=1) / valid_count
+            masked_hidden = hidden.masked_fill(~valid_mask, torch.finfo(hidden.dtype).min)
+            pooled = masked_hidden.max(dim=1).values
+            all_padded = valid_mask.sum(dim=1).eq(0)
+            return torch.where(all_padded, torch.zeros_like(pooled), pooled)
         if self.pooling == "mean":
             return hidden.mean(dim=1)
         return hidden.max(dim=1).values
@@ -297,21 +364,43 @@ class FiLMConditioner(nn.Module):
 
 
 class ActionComponentDecompositionHead(nn.Module):
-    def __init__(self, hidden_dim: int, action_dim: int, chunk_size: int, num_anchors: int):
+    def __init__(
+        self,
+        hidden_dim: int,
+        action_dim: int,
+        chunk_size: int,
+        num_anchors: int,
+        position_temperature: float = 0.25,
+        min_separation: float = 0.0,
+    ):
         super().__init__()
         self.chunk_size = chunk_size
         self.action_dim = action_dim
         self.num_anchors = num_anchors
+        self.position_temperature = position_temperature
+        self.min_separation = min_separation
 
         self.gate_head = nn.Linear(hidden_dim, 2)
         self.anchor_head = nn.Linear(hidden_dim, num_anchors * action_dim)
         self.refined_head = nn.Linear(hidden_dim, chunk_size * action_dim)
         self.anchor_positions = nn.Parameter(torch.linspace(0.0, 1.0, num_anchors))
 
+    def constrained_anchor_positions(self) -> Tensor:
+        if self.num_anchors == 2:
+            return torch.tensor([0.0, 1.0], device=self.anchor_positions.device, dtype=self.anchor_positions.dtype)
+
+        free_span = 1.0 - self.min_separation * (self.num_anchors - 1)
+        interior_logits = self.anchor_positions[1:-1] / self.position_temperature
+        gap_logits = torch.cat([interior_logits, interior_logits.new_zeros(1)], dim=0)
+        gap_weights = gap_logits.softmax(dim=0)
+        gaps = self.min_separation + free_span * gap_weights
+        return torch.cat([gaps.new_zeros(1), torch.cumsum(gaps, dim=0)], dim=0)
+
     def forward(self, hidden: Tensor) -> dict[str, Tensor]:
+        anchor_positions = self.constrained_anchor_positions()
         gates = self.gate_head(hidden).softmax(dim=-1)
         anchor_values = self.anchor_head(hidden).view(hidden.shape[0], self.num_anchors, self.action_dim)
-        trend = interpolate_trend_from_anchors(anchor_values, self.anchor_positions, self.chunk_size)
+        trend = interpolate_trend_from_anchors(anchor_values, anchor_positions, self.chunk_size)
         refined = self.refined_head(hidden).view(hidden.shape[0], self.chunk_size, self.action_dim)
 
         trend_weight = gates[:, 0].view(-1, 1, 1)
@@ -320,6 +409,7 @@ class ActionComponentDecompositionHead(nn.Module):
         return {
             "gates": gates,
             "anchor_values": anchor_values,
+            "anchor_positions": anchor_positions,
             "trend": trend,
             "refined": refined,
             "reconstruction": reconstruction,
@@ -805,8 +895,19 @@ class VLAFlowMatching(nn.Module):
         self.action_time_mlp_out = nn.Linear(
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
-        self.register_buffer("component_schedule_step", torch.zeros((), dtype=torch.long), persistent=False)
+        self.register_buffer("component_schedule_step", torch.zeros((), dtype=torch.long), persistent=True)
         self.cached_prefix_state_token: Tensor | None = None
+        if self.config.component_teacher_schedule_steps is None:
+            inferred_total_steps = infer_component_teacher_schedule_steps_from_pretrained_path(
+                self.config.pretrained_path
+            )
+            if inferred_total_steps is not None:
+                self.config.component_teacher_schedule_steps = inferred_total_steps
+        inferred_schedule_step = infer_component_schedule_step_from_pretrained_path(
+            self.config.pretrained_path
+        )
+        if inferred_schedule_step is not None:
+            self.component_schedule_step.fill_(inferred_schedule_step)
 
         if self.config.enable_action_component_branch:
             self.action_chunk_encoder = ActionChunkEncoder(
@@ -825,6 +926,8 @@ class VLAFlowMatching(nn.Module):
                 action_dim=self.config.max_action_dim,
                 chunk_size=self.config.chunk_size,
                 num_anchors=self.config.component_num_anchors,
+                position_temperature=self.config.component_anchor_position_temperature,
+                min_separation=self.config.component_anchor_min_separation,
             )
             self.component_predictor = ComponentPredictor(
                 context_dim=self.vlm_with_expert.config.text_config.hidden_size,
@@ -1064,11 +1167,15 @@ class VLAFlowMatching(nn.Module):
                 return_prefix_state_token=True,
             )
             e = prefix_outputs.prefix_state_token
-            encoded_actions = self.action_chunk_encoder(actions)
+            encoded_actions = self.action_chunk_encoder(actions, action_is_pad=action_is_pad)
             conditioned_actions = self.action_condition_film(encoded_actions, e)
             decomposition = self.action_decomposition_head(conditioned_actions)
             z_hat = self.component_predictor(e)
-            lowpass_target = build_lowpass_target(actions, self.action_decomposition_head.anchor_positions)
+            lowpass_target = build_lowpass_target(
+                actions,
+                decomposition["anchor_positions"],
+                action_is_pad=action_is_pad,
+            )
             reg_losses = compute_component_regularization_losses(
                 decomposition["gates"],
                 decomposition["trend"],
@@ -1081,9 +1188,14 @@ class VLAFlowMatching(nn.Module):
                 action_is_pad,
             )
             loss_comp = F.mse_loss(z_hat, decomposition["gates"].detach(), reduction="none").mean(dim=-1)
+            component_schedule_total_steps = (
+                self.config.component_teacher_schedule_steps
+                if self.config.component_teacher_schedule_steps is not None
+                else self.config.scheduler_decay_steps
+            )
             component_weight = compute_component_teacher_weight(
                 int(self.component_schedule_step.item()),
-                self.config.scheduler_decay_steps,
+                component_schedule_total_steps,
                 self.config.component_teacher_warmup_ratio,
                 self.config.component_teacher_decay_ratio,
                 self.config.component_teacher_min_weight,
