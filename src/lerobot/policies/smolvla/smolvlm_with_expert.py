@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -67,6 +68,23 @@ def get_intermediate_size(hidden_dim, ffn_dim_multiplier=4, multiple_of=256):
     hidden_dim = int(ffn_dim_multiplier * hidden_dim)
     hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
     return hidden_dim
+
+
+@dataclass
+class SmolVLMForwardOutput:
+    outputs_embeds: list[torch.Tensor | None]
+    past_key_values: dict | None
+    prefix_state_token: torch.Tensor | None = None
+
+    def __iter__(self):
+        yield self.outputs_embeds
+        yield self.past_key_values
+
+
+def extract_prefix_state_token(prefix_hidden: torch.Tensor, prefix_pad_masks: torch.Tensor) -> torch.Tensor:
+    batch_indices = torch.arange(prefix_hidden.shape[0], device=prefix_hidden.device)
+    token_indices = prefix_pad_masks.sum(dim=1) - 1
+    return prefix_hidden[batch_indices, token_indices]
 
 
 class SmolVLMWithExpertModel(nn.Module):
@@ -420,6 +438,8 @@ class SmolVLMWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] = None,
         use_cache: bool | None = None,
         fill_kv_cache: bool | None = None,
+        prefix_pad_masks: torch.Tensor | None = None,
+        return_prefix_state_token: bool = False,
     ):
         models = [self.get_vlm_model().text_model, self.lm_expert]
         model_layers = self.get_model_layers(models)
@@ -507,7 +527,16 @@ class SmolVLMWithExpertModel(nn.Module):
                 outputs_embeds.append(out_emb)
             else:
                 outputs_embeds.append(None)
-        return outputs_embeds, past_key_values
+        prefix_state_token = None
+        if return_prefix_state_token:
+            if outputs_embeds[0] is None or prefix_pad_masks is None:
+                raise ValueError("prefix_pad_masks is required when return_prefix_state_token=True")
+            prefix_state_token = extract_prefix_state_token(outputs_embeds[0], prefix_pad_masks)
+        return SmolVLMForwardOutput(
+            outputs_embeds=outputs_embeds,
+            past_key_values=past_key_values,
+            prefix_state_token=prefix_state_token,
+        )
 
     def get_attention_interface(self):
         attention_interface = self.eager_attention_forward

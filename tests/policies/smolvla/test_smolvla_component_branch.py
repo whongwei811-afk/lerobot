@@ -25,6 +25,10 @@ from lerobot.policies.smolvla.modeling_smolvla import (
     interpolate_trend_from_anchors,
     reduce_action_loss_per_sample,
 )
+from lerobot.policies.smolvla.smolvlm_with_expert import (
+    SmolVLMForwardOutput,
+    extract_prefix_state_token,
+)
 
 
 def test_component_config_defaults_keep_feature_disabled():
@@ -107,3 +111,26 @@ def test_reduce_action_loss_per_sample_respects_action_is_pad():
     reduced = reduce_action_loss_per_sample(losses, action_is_pad)
 
     assert torch.allclose(reduced, torch.tensor([2.0, 5.0]))
+
+
+def test_extract_prefix_state_token_uses_last_valid_prefix_token():
+    prefix_hidden = torch.tensor(
+        [[[1.0, 1.0], [2.0, 2.0], [9.0, 9.0], [0.0, 0.0]]],
+        dtype=torch.float32,
+    )
+    prefix_pad_masks = torch.tensor([[True, True, True, False]])
+
+    state_token = extract_prefix_state_token(prefix_hidden, prefix_pad_masks)
+
+    assert state_token.shape == (1, 2)
+    assert torch.equal(state_token, torch.tensor([[9.0, 9.0]]))
+
+
+def test_smolvlm_forward_output_keeps_optional_prefix_state_token():
+    output = SmolVLMForwardOutput(
+        outputs_embeds=[torch.ones(1, 3, 4), torch.ones(1, 2, 6)],
+        past_key_values={},
+        prefix_state_token=torch.zeros(1, 4),
+    )
+
+    assert output.prefix_state_token.shape == (1, 4)
