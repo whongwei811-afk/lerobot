@@ -169,6 +169,190 @@ def pad_vector(vector, new_dim):
     return new_vector
 
 
+def compute_component_teacher_weight(
+    step: int,
+    total_steps: int,
+    warmup_ratio: float,
+    decay_ratio: float,
+    min_weight: float,
+) -> float:
+    if total_steps <= 0:
+        return min_weight
+
+    warmup_steps = int(total_steps * warmup_ratio)
+    decay_steps = int(total_steps * decay_ratio)
+
+    if step <= warmup_steps:
+        return 1.0
+    if decay_steps <= 0 or step >= warmup_steps + decay_steps:
+        return min_weight
+
+    progress = (step - warmup_steps) / decay_steps
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_weight + (1.0 - min_weight) * cosine
+
+
+def interpolate_trend_from_anchors(anchor_values: Tensor, anchor_positions: Tensor, chunk_size: int) -> Tensor:
+    time_grid = torch.linspace(
+        0.0, 1.0, chunk_size, device=anchor_values.device, dtype=anchor_values.dtype
+    )
+    anchor_positions = anchor_positions.to(device=anchor_values.device, dtype=anchor_values.dtype)
+    anchor_positions = anchor_positions.clamp(0.0, 1.0).sort().values
+
+    lower_idx = torch.bucketize(time_grid, anchor_positions, right=True).clamp(
+        min=1, max=anchor_positions.numel() - 1
+    )
+    left_idx = lower_idx - 1
+    right_idx = lower_idx
+
+    left_pos = anchor_positions[left_idx]
+    right_pos = anchor_positions[right_idx]
+    denom = (right_pos - left_pos).clamp_min(1e-6)
+    alpha = ((time_grid - left_pos) / denom).view(1, chunk_size, 1)
+
+    left_values = anchor_values[:, left_idx, :]
+    right_values = anchor_values[:, right_idx, :]
+    return left_values + alpha * (right_values - left_values)
+
+
+def build_lowpass_target(actions: Tensor, anchor_positions: Tensor) -> Tensor:
+    idx = torch.round(anchor_positions * (actions.shape[1] - 1)).long().clamp(0, actions.shape[1] - 1)
+    anchor_values = actions[:, idx, :]
+    return interpolate_trend_from_anchors(anchor_values, anchor_positions, actions.shape[1])
+
+
+def reduce_action_loss_per_sample(losses: Tensor, action_is_pad: Tensor | None = None) -> Tensor:
+    if action_is_pad is None:
+        return losses.mean(dim=(1, 2))
+
+    valid_mask = (~action_is_pad).unsqueeze(-1)
+    masked_losses = losses * valid_mask
+    valid_count = valid_mask.expand_as(losses).sum(dim=(1, 2)).clamp_min(1)
+    return masked_losses.sum(dim=(1, 2)) / valid_count
+
+
+def compute_component_regularization_losses(
+    gates: Tensor,
+    trend: Tensor,
+    lowpass_target: Tensor,
+    refined: Tensor,
+    action_is_pad: Tensor | None = None,
+) -> dict[str, Tensor]:
+    safe_gates = gates.clamp_min(1e-6)
+    entropy = -(safe_gates * safe_gates.log()).sum(dim=-1) / math.log(2.0)
+    balance = torch.square(gates.mean(dim=0, keepdim=True) - gates.new_tensor([[0.5, 0.5]])).sum(
+        dim=-1
+    )
+    balance = balance.expand(gates.shape[0])
+    trend_prior = reduce_action_loss_per_sample(
+        F.mse_loss(trend, lowpass_target, reduction="none"), action_is_pad
+    )
+    ref_mag = reduce_action_loss_per_sample(refined.square(), action_is_pad)
+
+    if action_is_pad is None:
+        ref_center = refined.mean(dim=1).square().mean(dim=-1)
+    else:
+        valid_mask = (~action_is_pad).unsqueeze(-1).to(refined.dtype)
+        valid_count = valid_mask.sum(dim=1).clamp_min(1)
+        ref_center = ((refined * valid_mask).sum(dim=1) / valid_count).square().mean(dim=-1)
+
+    return {
+        "loss_reg_gate_entropy": entropy,
+        "loss_reg_gate_balance": balance,
+        "loss_reg_trend_prior": trend_prior,
+        "loss_reg_ref_mag": ref_mag,
+        "loss_reg_ref_center": ref_center,
+    }
+
+
+class ActionChunkEncoder(nn.Module):
+    def __init__(self, action_dim: int, hidden_dim: int, kernel_size: int, pooling: str):
+        super().__init__()
+        self.in_proj = nn.Linear(action_dim, hidden_dim)
+        self.temporal_conv = nn.Conv1d(
+            hidden_dim, hidden_dim, kernel_size, padding=kernel_size // 2
+        )
+        self.pooling = pooling
+
+    def forward(self, actions: Tensor) -> Tensor:
+        hidden = self.in_proj(actions)
+        hidden = self.temporal_conv(hidden.transpose(1, 2)).transpose(1, 2)
+        if self.pooling == "mean":
+            return hidden.mean(dim=1)
+        return hidden.max(dim=1).values
+
+
+class FiLMConditioner(nn.Module):
+    def __init__(self, context_dim: int, target_dim: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(context_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, target_dim * 2),
+        )
+
+    def forward(self, target: Tensor, context: Tensor) -> Tensor:
+        gamma, beta = self.net(context).chunk(2, dim=-1)
+        return (1.0 + gamma) * target + beta
+
+
+class ActionComponentDecompositionHead(nn.Module):
+    def __init__(self, hidden_dim: int, action_dim: int, chunk_size: int, num_anchors: int):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.action_dim = action_dim
+        self.num_anchors = num_anchors
+
+        self.gate_head = nn.Linear(hidden_dim, 2)
+        self.anchor_head = nn.Linear(hidden_dim, num_anchors * action_dim)
+        self.refined_head = nn.Linear(hidden_dim, chunk_size * action_dim)
+        self.anchor_positions = nn.Parameter(torch.linspace(0.0, 1.0, num_anchors))
+
+    def forward(self, hidden: Tensor) -> dict[str, Tensor]:
+        gates = self.gate_head(hidden).softmax(dim=-1)
+        anchor_values = self.anchor_head(hidden).view(hidden.shape[0], self.num_anchors, self.action_dim)
+        trend = interpolate_trend_from_anchors(anchor_values, self.anchor_positions, self.chunk_size)
+        refined = self.refined_head(hidden).view(hidden.shape[0], self.chunk_size, self.action_dim)
+
+        trend_weight = gates[:, 0].view(-1, 1, 1)
+        refined_weight = gates[:, 1].view(-1, 1, 1)
+        reconstruction = trend_weight * trend + refined_weight * refined
+        return {
+            "gates": gates,
+            "anchor_values": anchor_values,
+            "trend": trend,
+            "refined": refined,
+            "reconstruction": reconstruction,
+        }
+
+
+class ComponentPredictor(nn.Module):
+    def __init__(self, context_dim: int, hidden_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(context_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2),
+        )
+
+    def forward(self, context: Tensor) -> Tensor:
+        return self.net(context).softmax(dim=-1)
+
+
+class SuffixComponentFiLM(nn.Module):
+    def __init__(self, component_dim: int, hidden_dim: int, target_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(component_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, target_dim * 2),
+        )
+
+    def forward(self, components: Tensor) -> tuple[Tensor, Tensor]:
+        gamma, beta = self.net(components).chunk(2, dim=-1)
+        return gamma[:, None, :], beta[:, None, :]
+
+
 def normalize(x, min_val, max_val):
     return (x - min_val) / (max_val - min_val)
 
@@ -379,36 +563,65 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        model_outputs = self.model.forward(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            actions,
+            noise,
+            time,
+            action_is_pad=actions_is_pad,
+        )
         original_action_dim = self.config.action_feature.shape[0]
-        losses = losses[:, :, :original_action_dim]
-        loss_dict["losses_after_forward"] = losses.clone().mean().item()
+        flow_losses = model_outputs["flow_losses"][:, :, :original_action_dim]
+        loss_dict["losses_after_forward"] = flow_losses.clone().mean().item()
 
         if actions_is_pad is not None:
             in_episode_bound = ~actions_is_pad
-            losses = losses * in_episode_bound.unsqueeze(-1)
-            loss_dict["losses_after_in_ep_bound"] = losses.clone().mean().item()
+            masked_flow_losses = flow_losses * in_episode_bound.unsqueeze(-1)
+            loss_dict["losses_after_in_ep_bound"] = masked_flow_losses.clone().mean().item()
+        else:
+            masked_flow_losses = flow_losses
 
         # Remove padding
-        losses = losses[:, :, : self.config.max_action_dim]
-        loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
+        flow_losses = flow_losses[:, :, : self.config.max_action_dim]
+        masked_flow_losses = masked_flow_losses[:, :, : self.config.max_action_dim]
+        loss_dict["losses_after_rm_padding"] = masked_flow_losses.clone().mean().item()
+
+        flow_per_sample = reduce_action_loss_per_sample(flow_losses, actions_is_pad)
+        recon_per_sample = model_outputs["loss_recon"]
+        comp_per_sample = model_outputs["loss_comp"]
+        reg_per_sample = (
+            self.config.loss_weight_reg_gate_entropy * model_outputs["loss_reg_gate_entropy"]
+            + self.config.loss_weight_reg_gate_balance * model_outputs["loss_reg_gate_balance"]
+            + self.config.loss_weight_reg_trend_prior * model_outputs["loss_reg_trend_prior"]
+            + self.config.loss_weight_reg_ref_mag * model_outputs["loss_reg_ref_mag"]
+            + self.config.loss_weight_reg_ref_center * model_outputs["loss_reg_ref_center"]
+        )
+        total_per_sample = (
+            flow_per_sample
+            + self.config.loss_weight_recon * recon_per_sample
+            + self.config.loss_weight_comp * comp_per_sample
+            + reg_per_sample
+        )
+
+        loss_dict["loss_flow"] = flow_per_sample.mean().item()
+        loss_dict["loss_recon"] = recon_per_sample.mean().item()
+        loss_dict["loss_comp"] = comp_per_sample.mean().item()
+        loss_dict["loss_reg"] = reg_per_sample.mean().item()
+        loss_dict["loss_reg_gate_entropy"] = model_outputs["loss_reg_gate_entropy"].mean().item()
+        loss_dict["loss_reg_gate_balance"] = model_outputs["loss_reg_gate_balance"].mean().item()
+        loss_dict["loss_reg_trend_prior"] = model_outputs["loss_reg_trend_prior"].mean().item()
+        loss_dict["loss_reg_ref_mag"] = model_outputs["loss_reg_ref_mag"].mean().item()
+        loss_dict["loss_reg_ref_center"] = model_outputs["loss_reg_ref_center"].mean().item()
 
         if reduction == "none":
-            # Return per-sample losses (B,) by averaging over valid (time, action) entries
-            if actions_is_pad is None:
-                per_sample_loss = losses.mean(dim=(1, 2))
-            else:
-                num_valid = ((~actions_is_pad).sum(dim=1) * losses.shape[-1]).clamp_min(1)
-                per_sample_loss = losses.sum(dim=(1, 2)) / num_valid
-            loss_dict["loss"] = per_sample_loss.mean().item()
-            return per_sample_loss, loss_dict
+            loss_dict["loss"] = total_per_sample.mean().item()
+            return total_per_sample, loss_dict
         else:
-            # Default: return scalar mean loss over valid (time, action) entries
-            if actions_is_pad is None:
-                loss = losses.mean()
-            else:
-                num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
-                loss = losses.sum() / num_valid
+            loss = total_per_sample.mean()
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
@@ -592,6 +805,38 @@ class VLAFlowMatching(nn.Module):
         self.action_time_mlp_out = nn.Linear(
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
+        self.register_buffer("component_schedule_step", torch.zeros((), dtype=torch.long), persistent=False)
+        self.cached_prefix_state_token: Tensor | None = None
+
+        if self.config.enable_action_component_branch:
+            self.action_chunk_encoder = ActionChunkEncoder(
+                action_dim=self.config.max_action_dim,
+                hidden_dim=self.config.component_hidden_dim,
+                kernel_size=self.config.component_conv_kernel_size,
+                pooling=self.config.component_pooling,
+            )
+            self.action_condition_film = FiLMConditioner(
+                context_dim=self.vlm_with_expert.config.text_config.hidden_size,
+                target_dim=self.config.component_hidden_dim,
+                hidden_dim=self.config.component_predictor_hidden_dim,
+            )
+            self.action_decomposition_head = ActionComponentDecompositionHead(
+                hidden_dim=self.config.component_hidden_dim,
+                action_dim=self.config.max_action_dim,
+                chunk_size=self.config.chunk_size,
+                num_anchors=self.config.component_num_anchors,
+            )
+            self.component_predictor = ComponentPredictor(
+                context_dim=self.vlm_with_expert.config.text_config.hidden_size,
+                hidden_dim=self.config.component_predictor_hidden_dim,
+            )
+
+        if self.config.enable_suffix_component_film:
+            self.suffix_component_film = SuffixComponentFiLM(
+                component_dim=2,
+                hidden_dim=self.config.suffix_component_film_hidden_dim,
+                target_dim=self.vlm_with_expert.expert_hidden_size,
+            )
 
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
@@ -633,6 +878,12 @@ class VLAFlowMatching(nn.Module):
         time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
         time = time_beta * 0.999 + 0.001
         return time
+
+    def apply_suffix_component_film(self, suffix_embs: Tensor, components: Tensor) -> Tensor:
+        if not self.config.enable_suffix_component_film:
+            return suffix_embs
+        gamma, beta = self.suffix_component_film(components)
+        return suffix_embs * (1.0 + gamma) + beta
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
@@ -772,9 +1023,9 @@ class VLAFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
-    ) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None, action_is_pad=None
+    ) -> dict[str, Tensor]:
+        """Do a full training forward pass and compute grouped per-sample losses."""
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
@@ -787,14 +1038,67 @@ class VLAFlowMatching(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
+
+        loss_recon = actions.new_zeros(actions.shape[0])
+        loss_comp = actions.new_zeros(actions.shape[0])
+        reg_losses = {
+            "loss_reg_gate_entropy": actions.new_zeros(actions.shape[0]),
+            "loss_reg_gate_balance": actions.new_zeros(actions.shape[0]),
+            "loss_reg_trend_prior": actions.new_zeros(actions.shape[0]),
+            "loss_reg_ref_mag": actions.new_zeros(actions.shape[0]),
+            "loss_reg_ref_center": actions.new_zeros(actions.shape[0]),
+        }
+
+        if self.config.enable_action_component_branch:
+            prefix_outputs = self.vlm_with_expert.forward(
+                attention_mask=prefix_att_2d_masks,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=False,
+                fill_kv_cache=False,
+                prefix_pad_masks=prefix_pad_masks,
+                return_prefix_state_token=True,
+            )
+            e = prefix_outputs.prefix_state_token
+            encoded_actions = self.action_chunk_encoder(actions)
+            conditioned_actions = self.action_condition_film(encoded_actions, e)
+            decomposition = self.action_decomposition_head(conditioned_actions)
+            z_hat = self.component_predictor(e)
+            lowpass_target = build_lowpass_target(actions, self.action_decomposition_head.anchor_positions)
+            reg_losses = compute_component_regularization_losses(
+                decomposition["gates"],
+                decomposition["trend"],
+                lowpass_target,
+                decomposition["refined"],
+                action_is_pad,
+            )
+            loss_recon = reduce_action_loss_per_sample(
+                F.mse_loss(decomposition["reconstruction"], actions, reduction="none"),
+                action_is_pad,
+            )
+            loss_comp = F.mse_loss(z_hat, decomposition["gates"].detach(), reduction="none").mean(dim=-1)
+            component_weight = compute_component_teacher_weight(
+                int(self.component_schedule_step.item()),
+                self.config.scheduler_decay_steps,
+                self.config.component_teacher_warmup_ratio,
+                self.config.component_teacher_decay_ratio,
+                self.config.component_teacher_min_weight,
+            )
+            z_mix = component_weight * decomposition["gates"].detach() + (1.0 - component_weight) * z_hat
+            suffix_embs = self.apply_suffix_component_film(suffix_embs, z_mix)
+            if self.training:
+                self.component_schedule_step.add_(1)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
+        outputs = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
@@ -802,12 +1106,18 @@ class VLAFlowMatching(nn.Module):
             use_cache=False,
             fill_kv_cache=False,
         )
+        suffix_out = outputs.outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
-        losses = F.mse_loss(u_t, v_t, reduction="none")
-        return losses
+        flow_losses = F.mse_loss(u_t, v_t, reduction="none")
+        return {
+            "flow_losses": flow_losses,
+            "loss_recon": loss_recon,
+            "loss_comp": loss_comp,
+            **reg_losses,
+        }
 
     def sample_actions(
         self,
@@ -833,14 +1143,18 @@ class VLAFlowMatching(nn.Module):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         # Compute image and language key value cache
-        _, past_key_values = self.vlm_with_expert.forward(
+        prefix_outputs = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
+            prefix_pad_masks=prefix_pad_masks,
+            return_prefix_state_token=self.config.enable_action_component_branch,
         )
+        self.cached_prefix_state_token = prefix_outputs.prefix_state_token
+        past_key_values = prefix_outputs.past_key_values
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
 
@@ -889,6 +1203,13 @@ class VLAFlowMatching(nn.Module):
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
+        if (
+            self.config.enable_action_component_branch
+            and self.config.enable_suffix_component_film
+            and self.cached_prefix_state_token is not None
+        ):
+            z_hat = self.component_predictor(self.cached_prefix_state_token)
+            suffix_embs = self.apply_suffix_component_film(suffix_embs, z_hat)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -901,7 +1222,7 @@ class VLAFlowMatching(nn.Module):
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-        outputs_embeds, _ = self.vlm_with_expert.forward(
+        outputs = self.vlm_with_expert.forward(
             attention_mask=full_att_2d_masks,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -909,7 +1230,7 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=False,
         )
-        suffix_out = outputs_embeds[1]
+        suffix_out = outputs.outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
