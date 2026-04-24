@@ -329,3 +329,35 @@ def test_smolvla_denoise_step_uses_z_hat_without_decomposition(monkeypatch):
     assert film_calls["count"] == 1
     assert v_t.shape == (2, 5, 3)
     assert torch.isfinite(v_t).all()
+
+
+def test_smolvla_component_branch_disabled_keeps_zero_aux_losses(monkeypatch):
+    monkeypatch.setattr(
+        "lerobot.policies.smolvla.modeling_smolvla.require_package",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "lerobot.policies.smolvla.modeling_smolvla.SmolVLMWithExpertModel",
+        lambda *args, **kwargs: DummySmolVLM(text_hidden_size=8, expert_hidden_size=6),
+    )
+    config = SmolVLAConfig(max_state_dim=4, max_action_dim=3, chunk_size=5, n_action_steps=5)
+    config.input_features = {
+        "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(4,)),
+        "observation.images.base_0_rgb": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 8, 8)),
+    }
+    config.output_features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(3,))}
+    policy = SmolVLAPolicy(config)
+
+    batch = {
+        OBS_STATE: torch.randn(2, 4),
+        "observation.images.base_0_rgb": torch.rand(2, 3, 8, 8),
+        OBS_LANGUAGE_TOKENS: torch.ones(2, 3, dtype=torch.long),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.ones(2, 3, dtype=torch.bool),
+        ACTION: torch.randn(2, 5, 3),
+    }
+
+    _, loss_dict = policy.forward(batch, reduction="mean")
+
+    assert loss_dict["loss_recon"] == pytest.approx(0.0)
+    assert loss_dict["loss_comp"] == pytest.approx(0.0)
+    assert loss_dict["loss_reg"] == pytest.approx(0.0)
