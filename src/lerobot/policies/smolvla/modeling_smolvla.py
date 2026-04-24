@@ -169,6 +169,102 @@ def pad_vector(vector, new_dim):
     return new_vector
 
 
+def compute_component_teacher_weight(
+    step: int,
+    total_steps: int,
+    warmup_ratio: float,
+    decay_ratio: float,
+    min_weight: float,
+) -> float:
+    if total_steps <= 0:
+        return min_weight
+
+    warmup_steps = int(total_steps * warmup_ratio)
+    decay_steps = int(total_steps * decay_ratio)
+
+    if step <= warmup_steps:
+        return 1.0
+    if decay_steps <= 0 or step >= warmup_steps + decay_steps:
+        return min_weight
+
+    progress = (step - warmup_steps) / decay_steps
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_weight + (1.0 - min_weight) * cosine
+
+
+def interpolate_trend_from_anchors(anchor_values: Tensor, anchor_positions: Tensor, chunk_size: int) -> Tensor:
+    time_grid = torch.linspace(
+        0.0, 1.0, chunk_size, device=anchor_values.device, dtype=anchor_values.dtype
+    )
+    anchor_positions = anchor_positions.to(device=anchor_values.device, dtype=anchor_values.dtype)
+    anchor_positions = anchor_positions.clamp(0.0, 1.0).sort().values
+
+    lower_idx = torch.bucketize(time_grid, anchor_positions, right=True).clamp(
+        min=1, max=anchor_positions.numel() - 1
+    )
+    left_idx = lower_idx - 1
+    right_idx = lower_idx
+
+    left_pos = anchor_positions[left_idx]
+    right_pos = anchor_positions[right_idx]
+    denom = (right_pos - left_pos).clamp_min(1e-6)
+    alpha = ((time_grid - left_pos) / denom).view(1, chunk_size, 1)
+
+    left_values = anchor_values[:, left_idx, :]
+    right_values = anchor_values[:, right_idx, :]
+    return left_values + alpha * (right_values - left_values)
+
+
+def build_lowpass_target(actions: Tensor, anchor_positions: Tensor) -> Tensor:
+    idx = torch.round(anchor_positions * (actions.shape[1] - 1)).long().clamp(0, actions.shape[1] - 1)
+    anchor_values = actions[:, idx, :]
+    return interpolate_trend_from_anchors(anchor_values, anchor_positions, actions.shape[1])
+
+
+def reduce_action_loss_per_sample(losses: Tensor, action_is_pad: Tensor | None = None) -> Tensor:
+    if action_is_pad is None:
+        return losses.mean(dim=(1, 2))
+
+    valid_mask = (~action_is_pad).unsqueeze(-1)
+    masked_losses = losses * valid_mask
+    valid_count = valid_mask.expand_as(losses).sum(dim=(1, 2)).clamp_min(1)
+    return masked_losses.sum(dim=(1, 2)) / valid_count
+
+
+def compute_component_regularization_losses(
+    gates: Tensor,
+    trend: Tensor,
+    lowpass_target: Tensor,
+    refined: Tensor,
+    action_is_pad: Tensor | None = None,
+) -> dict[str, Tensor]:
+    safe_gates = gates.clamp_min(1e-6)
+    entropy = -(safe_gates * safe_gates.log()).sum(dim=-1) / math.log(2.0)
+    balance = torch.square(gates.mean(dim=0, keepdim=True) - gates.new_tensor([[0.5, 0.5]])).sum(
+        dim=-1
+    )
+    balance = balance.expand(gates.shape[0])
+    trend_prior = reduce_action_loss_per_sample(
+        F.mse_loss(trend, lowpass_target, reduction="none"), action_is_pad
+    )
+    ref_mag = reduce_action_loss_per_sample(refined.square(), action_is_pad)
+
+    if action_is_pad is None:
+        ref_center = refined.mean(dim=1).square().mean(dim=-1)
+    else:
+        valid_mask = (~action_is_pad).unsqueeze(-1).to(refined.dtype)
+        valid_count = valid_mask.sum(dim=1).clamp_min(1)
+        ref_center = ((refined * valid_mask).sum(dim=1) / valid_count).square().mean(dim=-1)
+
+    return {
+        "loss_reg_gate_entropy": entropy,
+        "loss_reg_gate_balance": balance,
+        "loss_reg_trend_prior": trend_prior,
+        "loss_reg_ref_mag": ref_mag,
+        "loss_reg_ref_center": ref_center,
+    }
+
+
 def normalize(x, min_val, max_val):
     return (x - min_val) / (max_val - min_val)
 
