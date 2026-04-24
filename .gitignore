@@ -172,6 +172,7 @@ outputs/
 
 # Dev folders
 .cache/*
+.worktrees/
 *.stl
 *.urdf
 *.xml
