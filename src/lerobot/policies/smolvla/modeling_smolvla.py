@@ -359,6 +359,7 @@ class FiLMConditioner(nn.Module):
         )
 
     def forward(self, target: Tensor, context: Tensor) -> Tensor:
+        context = context.to(dtype=self.net[0].weight.dtype)
         gamma, beta = self.net(context).chunk(2, dim=-1)
         return (1.0 + gamma) * target + beta
 
@@ -426,6 +427,7 @@ class ComponentPredictor(nn.Module):
         )
 
     def forward(self, context: Tensor) -> Tensor:
+        context = context.to(dtype=self.net[0].weight.dtype)
         return self.net(context).softmax(dim=-1)
 
 
@@ -439,6 +441,7 @@ class SuffixComponentFiLM(nn.Module):
         )
 
     def forward(self, components: Tensor) -> tuple[Tensor, Tensor]:
+        components = components.to(dtype=self.net[0].weight.dtype)
         gamma, beta = self.net(components).chunk(2, dim=-1)
         return gamma[:, None, :], beta[:, None, :]
 

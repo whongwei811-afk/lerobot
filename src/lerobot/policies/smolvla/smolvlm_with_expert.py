@@ -369,7 +369,7 @@ class SmolVLMWithExpertModel(nn.Module):
 
         # Expert
         expert_layer = model_layers[1][layer_idx]
-        if expert_layer is not None:
+        if expert_layer is not None and inputs_embeds[1] is not None:
             expert_hidden_states = expert_layer.input_layernorm(inputs_embeds[1])
 
             expert_input_shape = expert_hidden_states.shape[:-1]
