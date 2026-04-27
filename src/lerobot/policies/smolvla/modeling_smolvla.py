@@ -288,11 +288,20 @@ def reduce_action_loss_per_sample(losses: Tensor, action_is_pad: Tensor | None =
     return masked_losses.sum(dim=(1, 2)) / valid_count
 
 
+def compute_component_reconstruction_loss_per_sample(
+    reconstruction: Tensor,
+    actions: Tensor,
+    action_is_pad: Tensor | None = None,
+) -> Tensor:
+    losses = F.smooth_l1_loss(reconstruction, actions, reduction="none")
+    return reduce_action_loss_per_sample(losses, action_is_pad)
+
+
 def compute_component_regularization_losses(
     gates: Tensor,
     trend: Tensor,
     lowpass_target: Tensor,
-    refined: Tensor,
+    residual: Tensor,
     action_is_pad: Tensor | None = None,
 ) -> dict[str, Tensor]:
     safe_gates = gates.clamp_min(1e-6)
@@ -304,14 +313,14 @@ def compute_component_regularization_losses(
     trend_prior = reduce_action_loss_per_sample(
         F.mse_loss(trend, lowpass_target, reduction="none"), action_is_pad
     )
-    ref_mag = reduce_action_loss_per_sample(refined.square(), action_is_pad)
+    ref_mag = reduce_action_loss_per_sample(residual.square(), action_is_pad)
 
     if action_is_pad is None:
-        ref_center = refined.mean(dim=1).square().mean(dim=-1)
+        ref_center = residual.mean(dim=1).square().mean(dim=-1)
     else:
-        valid_mask = (~action_is_pad).unsqueeze(-1).to(refined.dtype)
+        valid_mask = (~action_is_pad).unsqueeze(-1).to(residual.dtype)
         valid_count = valid_mask.sum(dim=1).clamp_min(1)
-        ref_center = ((refined * valid_mask).sum(dim=1) / valid_count).square().mean(dim=-1)
+        ref_center = ((residual * valid_mask).sum(dim=1) / valid_count).square().mean(dim=-1)
 
     return {
         "loss_reg_gate_entropy": entropy,
@@ -402,7 +411,8 @@ class ActionComponentDecompositionHead(nn.Module):
         gates = self.gate_head(hidden).softmax(dim=-1)
         anchor_values = self.anchor_head(hidden).view(hidden.shape[0], self.num_anchors, self.action_dim)
         trend = interpolate_trend_from_anchors(anchor_values, anchor_positions, self.chunk_size)
-        refined = self.refined_head(hidden).view(hidden.shape[0], self.chunk_size, self.action_dim)
+        residual = self.refined_head(hidden).view(hidden.shape[0], self.chunk_size, self.action_dim)
+        refined = trend + residual
 
         trend_weight = gates[:, 0].view(-1, 1, 1)
         refined_weight = gates[:, 1].view(-1, 1, 1)
@@ -412,6 +422,7 @@ class ActionComponentDecompositionHead(nn.Module):
             "anchor_values": anchor_values,
             "anchor_positions": anchor_positions,
             "trend": trend,
+            "residual": residual,
             "refined": refined,
             "reconstruction": reconstruction,
         }
@@ -1183,11 +1194,12 @@ class VLAFlowMatching(nn.Module):
                 decomposition["gates"],
                 decomposition["trend"],
                 lowpass_target,
-                decomposition["refined"],
+                decomposition["residual"],
                 action_is_pad,
             )
-            loss_recon = reduce_action_loss_per_sample(
-                F.mse_loss(decomposition["reconstruction"], actions, reduction="none"),
+            loss_recon = compute_component_reconstruction_loss_per_sample(
+                decomposition["reconstruction"],
+                actions,
                 action_is_pad,
             )
             loss_comp = F.mse_loss(z_hat, decomposition["gates"].detach(), reduction="none").mean(dim=-1)
