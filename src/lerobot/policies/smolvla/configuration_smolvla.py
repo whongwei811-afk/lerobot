@@ -137,11 +137,17 @@ class SmolVLAConfig(PreTrainedConfig):
     use_stage_condition_at_inference: bool = True
     inference_stage_source: str = "predicted"
     disable_stage_condition_for_eval: bool = False
+    use_adaptive_action_steps: bool = False
+    adaptive_action_steps_min: int = 2
+    adaptive_action_steps_max: int | None = None
+    adaptive_action_steps_source: str = "p_local"
 
     def __post_init__(self):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        if self.n_obs_steps <= 0:
+            raise ValueError(f"`n_obs_steps` must be positive, got {self.n_obs_steps}.")
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
@@ -171,17 +177,12 @@ class SmolVLAConfig(PreTrainedConfig):
         )
 
         if self.stage_head_hidden_dim <= 0:
-            raise ValueError(
-                f"`stage_head_hidden_dim` must be positive, got {self.stage_head_hidden_dim}."
-            )
+            raise ValueError(f"`stage_head_hidden_dim` must be positive, got {self.stage_head_hidden_dim}.")
         if self.stage_loss_weight < 0.0:
-            raise ValueError(
-                f"`stage_loss_weight` must be non-negative, got {self.stage_loss_weight}."
-            )
+            raise ValueError(f"`stage_loss_weight` must be non-negative, got {self.stage_loss_weight}.")
         if self.stage_pooling not in {"last_state_token", "mean"}:
             raise ValueError(
-                "`stage_pooling` must be one of {'last_state_token', 'mean'}, got "
-                f"'{self.stage_pooling}'."
+                f"`stage_pooling` must be one of {{'last_state_token', 'mean'}}, got '{self.stage_pooling}'."
             )
         if self.stage_condition_mode != "film":
             raise ValueError(
@@ -207,8 +208,7 @@ class SmolVLAConfig(PreTrainedConfig):
             )
         if self.train_metric_window_size <= 0:
             raise ValueError(
-                "`train_metric_window_size` must be positive, "
-                f"got {self.train_metric_window_size}."
+                f"`train_metric_window_size` must be positive, got {self.train_metric_window_size}."
             )
         if self.alpha_schedule not in {"linear", "cosine"}:
             raise ValueError(
@@ -216,13 +216,36 @@ class SmolVLAConfig(PreTrainedConfig):
                 f"got '{self.alpha_schedule}'."
             )
         if self.alpha_hold_steps < 0:
-            raise ValueError(
-                f"`alpha_hold_steps` must be non-negative, got {self.alpha_hold_steps}."
-            )
+            raise ValueError(f"`alpha_hold_steps` must be non-negative, got {self.alpha_hold_steps}.")
         if self.inference_stage_source != "predicted":
             raise ValueError(
                 "`inference_stage_source` only supports 'predicted' in this stage, got "
                 f"'{self.inference_stage_source}'."
+            )
+        if self.adaptive_action_steps_min <= 0:
+            raise ValueError(
+                f"`adaptive_action_steps_min` must be positive, got {self.adaptive_action_steps_min}."
+            )
+        if self.adaptive_action_steps_max is not None and self.adaptive_action_steps_max <= 0:
+            raise ValueError(
+                f"`adaptive_action_steps_max` must be positive, got {self.adaptive_action_steps_max}."
+            )
+        if self.use_adaptive_action_steps:
+            adaptive_max = self.adaptive_action_steps_max or self.n_action_steps
+            if adaptive_max > self.n_action_steps:
+                raise ValueError(
+                    "`adaptive_action_steps_max` cannot exceed `n_action_steps`, got "
+                    f"{adaptive_max} > {self.n_action_steps}."
+                )
+            if self.adaptive_action_steps_min > adaptive_max:
+                raise ValueError(
+                    "`adaptive_action_steps_min` cannot exceed the adaptive action step maximum, got "
+                    f"{self.adaptive_action_steps_min} > {adaptive_max}."
+                )
+        if self.adaptive_action_steps_source != "p_local":
+            raise ValueError(
+                "`adaptive_action_steps_source` only supports 'p_local' in this stage, got "
+                f"'{self.adaptive_action_steps_source}'."
             )
 
     def validate_features(self) -> None:
@@ -253,7 +276,7 @@ class SmolVLAConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> list:
-        return [0]
+        return list(range(1 - self.n_obs_steps, 1))
 
     @property
     def action_delta_indices(self) -> list:

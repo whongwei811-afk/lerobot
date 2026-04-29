@@ -69,8 +69,8 @@ from ..utils import (
     populate_queues,
 )
 from .configuration_smolvla import SmolVLAConfig
-from .stage_label_provider import StageLabelProvider
 from .smolvlm_with_expert import SmolVLMWithExpertModel
+from .stage_label_provider import StageLabelProvider
 
 
 class ActionSelectKwargs(TypedDict, total=False):
@@ -309,7 +309,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._stage_label_provider: StageLabelProvider | None = None
         self._last_stage_head_output: dict[str, Tensor | None] | None = None
         self._train_metric_windows = {
-            key: deque(maxlen=self.config.train_metric_window_size) for key in self._SMOOTHED_TRAIN_METRIC_KEYS
+            key: deque(maxlen=self.config.train_metric_window_size)
+            for key in self._SMOOTHED_TRAIN_METRIC_KEYS
         }
         self.init_rtc_processor()
         self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
@@ -320,6 +321,15 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        self._stage_image_embedding_queues = {}
+        self._stage_image_mask_queues = {}
+        if self.config.n_obs_steps > 1:
+            self._queues[OBS_STATE] = deque(maxlen=self.config.n_obs_steps)
+            for key in self.config.image_features:
+                self._queues[key] = deque(maxlen=self.config.n_obs_steps)
+                if self.config.use_stage_head:
+                    self._stage_image_embedding_queues[key] = deque(maxlen=self.config.n_obs_steps)
+                    self._stage_image_mask_queues[key] = deque(maxlen=self.config.n_obs_steps)
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -343,7 +353,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def update(self) -> None:
         self.num_updates.add_(1)
 
-    def _build_train_log_dict(self, alpha: float, stage_loss: float, stage_agreement: float, l_stage: float) -> dict[str, float]:
+    def _build_train_log_dict(
+        self, alpha: float, stage_loss: float, stage_agreement: float, l_stage: float
+    ) -> dict[str, float]:
         metrics = {
             "alpha": float(alpha),
             "stage_loss": float(stage_loss),
@@ -397,7 +409,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
         return self.model.blend_stage_condition(z, z_hat, alpha)
 
     def _get_action_chunk(
-        self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
+        self,
+        batch: dict[str, Tensor],
+        noise: Tensor | None = None,
+        image_embs: list[Tensor] | None = None,
+        current_img_masks: list[Tensor] | None = None,
+        stage_image_embs: list[Tensor] | None = None,
+        cached_stage_img_masks: list[Tensor] | None = None,
+        **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         # TODO: Check if this for loop is needed.
         # Context: In fact, self.queues contains only ACTION field, and in inference, we don't have action in the batch
@@ -409,12 +428,31 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 batch[k] = torch.stack(list(self._queues[k]), dim=1)
 
         images, img_masks = self.prepare_images(batch)
+        if current_img_masks is not None:
+            img_masks = current_img_masks
+        stage_images = None
+        stage_img_masks = None
+        if self.config.use_stage_head and self.config.n_obs_steps > 1:
+            if stage_image_embs is not None and cached_stage_img_masks is not None:
+                stage_img_masks = cached_stage_img_masks
+            else:
+                stage_images, stage_img_masks = self.prepare_images(batch, use_history=True)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            noise=noise,
+            image_embs=image_embs,
+            stage_images=stage_images,
+            stage_img_masks=stage_img_masks,
+            stage_image_embs=stage_image_embs,
+            **kwargs,
         )
         self._cache_inference_stage_head_output()
 
@@ -441,8 +479,19 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         batch = self._prepare_batch(batch)
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
+        image_embs, current_img_masks, stage_image_embs, cached_stage_img_masks = (
+            self._maybe_update_inference_image_embedding_cache(batch)
+        )
 
-        actions = self._get_action_chunk(batch, noise, **kwargs)
+        actions = self._get_action_chunk(
+            batch,
+            noise,
+            image_embs=image_embs,
+            current_img_masks=current_img_masks,
+            stage_image_embs=stage_image_embs,
+            cached_stage_img_masks=cached_stage_img_masks,
+            **kwargs,
+        )
         return actions
 
     @torch.no_grad()
@@ -463,13 +512,25 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self.eval()
         batch = self._prepare_batch(batch)
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
+        image_embs, current_img_masks, stage_image_embs, cached_stage_img_masks = (
+            self._maybe_update_inference_image_embedding_cache(batch)
+        )
 
         if self._check_get_actions_condition():
-            actions = self._get_action_chunk(batch, noise)
+            actions = self._get_action_chunk(
+                batch,
+                noise,
+                image_embs=image_embs,
+                current_img_masks=current_img_masks,
+                stage_image_embs=stage_image_embs,
+                cached_stage_img_masks=cached_stage_img_masks,
+            )
 
             # `self.predict_action_chunk` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
-            self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
+            action_steps = self._resolve_inference_action_steps()
+            self._queues[ACTION].extend(actions.transpose(0, 1)[:action_steps])
+            self._cache_adaptive_action_steps(action_steps, device=actions.device)
 
         return self._queues[ACTION].popleft()
 
@@ -478,6 +539,111 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    def _resolve_inference_action_steps(self) -> int:
+        if not self.config.use_adaptive_action_steps:
+            return self.config.n_action_steps
+
+        max_steps = self.config.adaptive_action_steps_max or self.config.n_action_steps
+        max_steps = min(max_steps, self.config.n_action_steps, self.config.chunk_size)
+        min_steps = min(self.config.adaptive_action_steps_min, max_steps)
+        p_local = self._get_last_inference_p_local()
+        if p_local is None:
+            return max_steps
+
+        p_local = max(0.0, min(1.0, p_local))
+        action_steps = round(max_steps - p_local * (max_steps - min_steps))
+        return int(max(min_steps, min(max_steps, action_steps)))
+
+    def _get_last_inference_p_local(self) -> float | None:
+        if self._last_stage_head_output is None:
+            return None
+
+        stage_probs = self._last_stage_head_output.get("stage_probs")
+        if stage_probs is None or stage_probs.ndim != 2 or stage_probs.shape[-1] < 2:
+            return None
+
+        return float(stage_probs[:, 1].mean().item())
+
+    def _cache_adaptive_action_steps(self, action_steps: int, device: torch.device) -> None:
+        if self._last_stage_head_output is None:
+            return
+        self._last_stage_head_output["adaptive_action_steps"] = torch.tensor(
+            action_steps, dtype=torch.long, device=device
+        )
+
+    def _should_cache_inference_image_embeddings(self) -> bool:
+        if not (self.config.use_stage_head and self.config.n_obs_steps > 1):
+            return False
+        if not hasattr(self.model, "embed_images"):
+            return False
+
+        should_use_stage_condition = getattr(self.model, "should_use_stage_condition_at_inference", None)
+        if callable(should_use_stage_condition):
+            return bool(should_use_stage_condition())
+        return bool(self.config.use_stage_condition_at_inference)
+
+    def _maybe_update_inference_image_embedding_cache(
+        self, batch: dict[str, Tensor]
+    ) -> tuple[list[Tensor] | None, list[Tensor] | None, list[Tensor] | None, list[Tensor] | None]:
+        if not self._should_cache_inference_image_embeddings():
+            return None, None, None, None
+
+        present_img_keys = [key for key in self.config.image_features if key in batch]
+        missing_img_keys = [key for key in self.config.image_features if key not in batch]
+        if len(present_img_keys) == 0 or len(missing_img_keys) > 0:
+            return None, None, None, None
+
+        current_images, current_img_masks = self.prepare_images(batch)
+        if len(current_images) != len(present_img_keys):
+            return None, None, None, None
+
+        current_image_embs = self.model.embed_images(current_images)
+        if len(current_image_embs) != len(present_img_keys):
+            raise RuntimeError(
+                "Image embedding cache expected one embedding tensor per present image feature, "
+                f"got {len(current_image_embs)} embeddings for {len(present_img_keys)} features."
+            )
+
+        for key, image_emb, img_mask in zip(
+            present_img_keys, current_image_embs, current_img_masks, strict=False
+        ):
+            embedding_queue = self._stage_image_embedding_queues.get(key)
+            mask_queue = self._stage_image_mask_queues.get(key)
+            if embedding_queue is None or mask_queue is None:
+                return None, None, None, None
+
+            image_emb = image_emb.detach()
+            img_mask = img_mask.detach()
+            if len(embedding_queue) != embedding_queue.maxlen:
+                while len(embedding_queue) != embedding_queue.maxlen:
+                    embedding_queue.append(image_emb)
+                    mask_queue.append(img_mask)
+            else:
+                embedding_queue.append(image_emb)
+                mask_queue.append(img_mask)
+
+        stage_image_embs, stage_img_masks = self._get_cached_stage_image_embeddings(present_img_keys)
+        return current_image_embs, current_img_masks, stage_image_embs, stage_img_masks
+
+    def _get_cached_stage_image_embeddings(
+        self, image_keys: list[str]
+    ) -> tuple[list[Tensor] | None, list[Tensor] | None]:
+        stage_image_embs = []
+        stage_img_masks = []
+        for key in image_keys:
+            embedding_queue = self._stage_image_embedding_queues.get(key)
+            mask_queue = self._stage_image_mask_queues.get(key)
+            if (
+                embedding_queue is None
+                or mask_queue is None
+                or len(embedding_queue) != self.config.n_obs_steps
+                or len(mask_queue) != self.config.n_obs_steps
+            ):
+                return None, None
+            stage_image_embs.extend(list(embedding_queue))
+            stage_img_masks.extend(list(mask_queue))
+        return stage_image_embs, stage_img_masks
 
     def _get_stage_label_provider(self) -> StageLabelProvider:
         if not self.config.use_stage_labels:
@@ -496,9 +662,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             )
         return self._stage_label_provider
 
-    def _maybe_get_batch_stage_probs(
-        self, batch: dict[str, Tensor], device: torch.device
-    ) -> Tensor | None:
+    def _maybe_get_batch_stage_probs(self, batch: dict[str, Tensor], device: torch.device) -> Tensor | None:
         if not self.config.use_stage_labels:
             return None
 
@@ -543,6 +707,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             "total_loss_per_sample": None,
             "inference_p_global_mean": None,
             "inference_p_local_mean": None,
+            "adaptive_action_steps": None,
         }
 
     def _cache_inference_stage_head_output(self) -> None:
@@ -652,6 +817,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
 
         images, img_masks = self.prepare_images(batch)
+        stage_images = None
+        stage_img_masks = None
+        if self.config.use_stage_head and self.config.n_obs_steps > 1:
+            stage_images, stage_img_masks = self.prepare_images(batch, use_history=True)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
@@ -669,6 +838,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
             noise,
             time,
             stage_condition_probs=stage_label_probs,
+            stage_images=stage_images,
+            stage_img_masks=stage_img_masks,
             alpha=alpha,
         )
         stage_outputs = model_outputs.get("stage_outputs") if model_outputs is not None else None
@@ -678,9 +849,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         if stage_outputs is not None:
             stage_probs = stage_outputs["stage_probs"]
             if stage_label_probs is not None:
-                stage_agreement = (
-                    stage_label_probs.argmax(dim=-1) == stage_probs.argmax(dim=-1)
-                ).to(dtype=torch.float32)
+                stage_agreement = (stage_label_probs.argmax(dim=-1) == stage_probs.argmax(dim=-1)).to(
+                    dtype=torch.float32
+                )
                 stage_agreement_value = stage_agreement.mean().item()
             if stage_label_probs is not None:
                 stage_loss_per_sample = soft_target_cross_entropy(
@@ -723,8 +894,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 z_cond[:, 0] * l_large_per_sample + z_cond[:, 1] * l_small_per_sample
             )
             action_loss_per_sample = (
-                fm_loss_per_sample
-                + self.config.action_multiscale_loss_weight * action_multiscale_per_sample
+                fm_loss_per_sample + self.config.action_multiscale_loss_weight * action_multiscale_per_sample
             )
         else:
             action_loss_per_sample = fm_loss_per_sample
@@ -762,7 +932,25 @@ class SmolVLAPolicy(PreTrainedPolicy):
             loss = total_loss_per_sample.mean()
             return loss, loss_dict
 
-    def prepare_images(self, batch):
+    def _get_image_valid_mask(
+        self,
+        batch: dict[str, Tensor],
+        key: str,
+        bsize: int,
+        device: torch.device,
+        num_frames: int | None = None,
+    ) -> Tensor:
+        if f"{key}_padding_mask" in batch:
+            valid_mask = batch[f"{key}_padding_mask"].bool()
+        elif f"{key}_is_pad" in batch:
+            valid_mask = ~batch[f"{key}_is_pad"].bool()
+        else:
+            shape = (bsize, num_frames) if num_frames is not None else (bsize,)
+            return torch.ones(shape, dtype=torch.bool, device=device)
+
+        return valid_mask.to(device=device)
+
+    def prepare_images(self, batch, use_history: bool = False):
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
         convert pixel range from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
         """
@@ -776,32 +964,49 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 f"All image features are missing from the batch. At least one expected. (batch: {batch.keys()}) (image_features:{self.config.image_features})"
             )
         # Preprocess image features present in the batch
+        max_frames_per_camera = 1
         for key in present_img_keys:
-            img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
-            if self.config.resize_imgs_with_padding is not None:
-                img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
-
-            # Normalize from range [0,1] to [-1,1] as expacted by siglip
-            img = img * 2.0 - 1.0
-
-            bsize = img.shape[0]
-            device = img.device
-            if f"{key}_padding_mask" in batch:
-                mask = batch[f"{key}_padding_mask"].bool()
+            raw_img = batch[key]
+            bsize = raw_img.shape[0]
+            device = raw_img.device
+            if raw_img.ndim == 5:
+                num_frames = raw_img.shape[1]
+                valid_mask = self._get_image_valid_mask(batch, key, bsize, device, num_frames=num_frames)
+                if use_history:
+                    frame_imgs = list(raw_img.unbind(dim=1))
+                    max_frames_per_camera = max(max_frames_per_camera, len(frame_imgs))
+                    if valid_mask.ndim == 2:
+                        frame_masks = list(valid_mask.unbind(dim=1))
+                    else:
+                        frame_masks = [valid_mask] * len(frame_imgs)
+                else:
+                    frame_imgs = [raw_img[:, -1, :, :, :]]
+                    frame_masks = [valid_mask[:, -1]] if valid_mask.ndim == 2 else [valid_mask]
             else:
-                mask = torch.ones(bsize, dtype=torch.bool, device=device)
-            images.append(img)
-            img_masks.append(mask)
+                valid_mask = self._get_image_valid_mask(batch, key, bsize, device)
+                frame_imgs = [raw_img]
+                frame_masks = [valid_mask]
+
+            for img, mask in zip(frame_imgs, frame_masks, strict=False):
+                if self.config.resize_imgs_with_padding is not None:
+                    img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
+
+                # Normalize from range [0,1] to [-1,1] as expected by SigLIP.
+                img = img * 2.0 - 1.0
+
+                images.append(img)
+                img_masks.append(mask)
 
         # Create image features not present in the batch
         # as fully 0 padded images.
         for num_empty_cameras in range(len(missing_img_keys)):
             if num_empty_cameras >= self.config.empty_cameras:
                 break
-            img = torch.ones_like(img) * -1
-            mask = torch.zeros_like(mask)
-            images.append(img)
-            img_masks.append(mask)
+            for _ in range(max_frames_per_camera if use_history else 1):
+                img = torch.ones_like(images[0]) * -1
+                mask = torch.zeros_like(img_masks[0])
+                images.append(img)
+                img_masks.append(mask)
         return images, img_masks
 
     def _pi_aloha_decode_state(self, state):
@@ -1006,6 +1211,35 @@ class VLAFlowMatching(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time
 
+    def embed_images(self, images) -> list[Tensor]:
+        """Embed image tensors in shape-compatible batches while preserving prefix order."""
+        if len(images) == 0:
+            return []
+
+        image_embs: list[Tensor | None] = [None] * len(images)
+        image_groups: dict[tuple[torch.device, torch.dtype, tuple[int, ...]], list[int]] = {}
+        for image_idx, image in enumerate(images):
+            group_key = (image.device, image.dtype, tuple(image.shape[1:]))
+            image_groups.setdefault(group_key, []).append(image_idx)
+
+        for image_indices in image_groups.values():
+            batched_images = torch.cat([images[image_idx] for image_idx in image_indices], dim=0)
+            batched_embs = self.vlm_with_expert.embed_image(batched_images)
+
+            # Normalize image embeddings.
+            img_emb_dim = batched_embs.shape[-1]
+            batched_embs = batched_embs * torch.tensor(
+                img_emb_dim**0.5, dtype=batched_embs.dtype, device=batched_embs.device
+            )
+
+            split_sizes = [images[image_idx].shape[0] for image_idx in image_indices]
+            for image_idx, image_emb in zip(
+                image_indices, batched_embs.split(split_sizes, dim=0), strict=False
+            ):
+                image_embs[image_idx] = image_emb
+
+        return [image_emb for image_emb in image_embs if image_emb is not None]
+
     def encode_prefix_context(
         self,
         images,
@@ -1015,9 +1249,10 @@ class VLAFlowMatching(nn.Module):
         state,
         *,
         use_cache: bool,
+        image_embs: list[Tensor] | None = None,
     ) -> tuple[Tensor, Tensor, object]:
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, state=state, image_embs=image_embs
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -1033,7 +1268,13 @@ class VLAFlowMatching(nn.Module):
         return prefix_hidden_states, prefix_pad_masks, past_key_values
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state: torch.Tensor = None,
+        image_embs: list[Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
@@ -1041,17 +1282,23 @@ class VLAFlowMatching(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
-        for _img_idx, (
-            img,
-            img_mask,
-        ) in enumerate(zip(images, img_masks, strict=False)):
+        if image_embs is None:
+            image_embs = self.embed_images(images)
+        if len(image_embs) != len(img_masks):
+            raise ValueError(
+                "Image embeddings and image masks must have the same length, got "
+                f"{len(image_embs)} embeddings and {len(img_masks)} masks."
+            )
+
+        for img_emb, img_mask in zip(image_embs, img_masks, strict=False):
+            bsize = img_emb.shape[0]
             if self.add_image_special_tokens:
                 image_start_token = (
                     self.vlm_with_expert.embed_language_tokens(
-                        self.global_image_start_token.to(device=self.vlm_with_expert.vlm.device)
+                        self.global_image_start_token.to(device=img_emb.device)
                     )
                     .unsqueeze(0)
-                    .expand(img.shape[0], -1, -1)
+                    .expand(bsize, -1, -1)
                 )
                 image_start_mask = torch.ones_like(
                     image_start_token[:, :, 0], dtype=torch.bool, device=image_start_token.device
@@ -1060,14 +1307,7 @@ class VLAFlowMatching(nn.Module):
                 embs.append(image_start_token)
                 pad_masks.append(image_start_mask)
 
-            img_emb = self.vlm_with_expert.embed_image(img)
-            img_emb = img_emb
-
-            # Normalize image embeddings
-            img_emb_dim = img_emb.shape[-1]
-            img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
-
-            bsize, num_img_embs = img_emb.shape[:2]
+            num_img_embs = img_emb.shape[1]
             img_mask = img_mask[:, None].expand(bsize, num_img_embs)
 
             embs.append(img_emb)
@@ -1077,10 +1317,10 @@ class VLAFlowMatching(nn.Module):
             if self.add_image_special_tokens:
                 image_end_token = (
                     self.vlm_with_expert.embed_language_tokens(
-                        self.image_end_token.to(device=self.vlm_with_expert.vlm.device)
+                        self.image_end_token.to(device=img_emb.device)
                     )
                     .unsqueeze(0)
-                    .expand(img.shape[0], -1, -1)
+                    .expand(bsize, -1, -1)
                 )
                 image_end_mask = torch.ones_like(
                     image_end_token[:, :, 0], dtype=torch.bool, device=image_end_token.device
@@ -1183,13 +1423,10 @@ class VLAFlowMatching(nn.Module):
             return (prefix_hidden_states * valid_mask).sum(dim=1) / valid_count
 
         raise ValueError(
-            f"Unsupported stage pooling '{self.config.stage_pooling}'. "
-            "Expected 'last_state_token' or 'mean'."
+            f"Unsupported stage pooling '{self.config.stage_pooling}'. Expected 'last_state_token' or 'mean'."
         )
 
-    def predict_stage(
-        self, prefix_hidden_states: Tensor, prefix_pad_masks: Tensor
-    ) -> StageHeadOutput | None:
+    def predict_stage(self, prefix_hidden_states: Tensor, prefix_pad_masks: Tensor) -> StageHeadOutput | None:
         if not self.config.use_stage_head or self.stage_head is None:
             return None
 
@@ -1233,8 +1470,7 @@ class VLAFlowMatching(nn.Module):
         z_hat = stage_outputs["stage_probs"]
         if z_hat.ndim != 2 or z_hat.shape[-1] != 2:
             raise ValueError(
-                "Predicted stage probabilities must have shape [batch_size, 2], got "
-                f"{tuple(z_hat.shape)}."
+                f"Predicted stage probabilities must have shape [batch_size, 2], got {tuple(z_hat.shape)}."
             )
 
         z_cond = z_hat.to(dtype=torch.float32)
@@ -1265,7 +1501,9 @@ class VLAFlowMatching(nn.Module):
             return action_hidden, None
 
         if z_cond is None:
-            z_cond = torch.full((action_hidden.shape[0], 2), 0.5, dtype=torch.float32, device=action_hidden.device)
+            z_cond = torch.full(
+                (action_hidden.shape[0], 2), 0.5, dtype=torch.float32, device=action_hidden.device
+            )
         else:
             z_cond = z_cond.to(device=action_hidden.device, dtype=torch.float32)
 
@@ -1277,9 +1515,7 @@ class VLAFlowMatching(nn.Module):
 
     def decompose_action_scales(self, action_chunk: Tensor) -> tuple[Tensor, Tensor]:
         if self.config.action_large_scale_mode != "fixed_lowpass":
-            raise ValueError(
-                f"Unsupported action large-scale mode '{self.config.action_large_scale_mode}'."
-            )
+            raise ValueError(f"Unsupported action large-scale mode '{self.config.action_large_scale_mode}'.")
 
         kernel = self.config.action_large_scale_kernel
         if kernel == 1:
@@ -1315,6 +1551,8 @@ class VLAFlowMatching(nn.Module):
         noise=None,
         time=None,
         stage_condition_probs: Tensor | None = None,
+        stage_images=None,
+        stage_img_masks=None,
         alpha: float = 0.0,
     ) -> tuple[Tensor, ActionConditionedOutput | None]:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
@@ -1335,7 +1573,20 @@ class VLAFlowMatching(nn.Module):
             state,
             use_cache=True,
         )
-        stage_outputs = self.predict_stage(prefix_out, prefix_pad_masks)
+        stage_outputs = None
+        if self.config.use_stage_head and self.stage_head is not None:
+            stage_prefix_out = prefix_out
+            stage_prefix_pad_masks = prefix_pad_masks
+            if stage_images is not None and stage_img_masks is not None:
+                stage_prefix_out, stage_prefix_pad_masks, _ = self.encode_prefix_context(
+                    stage_images,
+                    stage_img_masks,
+                    lang_tokens,
+                    lang_masks,
+                    state,
+                    use_cache=False,
+                )
+            stage_outputs = self.predict_stage(stage_prefix_out, stage_prefix_pad_masks)
         z_hat = stage_outputs["stage_probs"] if stage_outputs is not None else None
         blended_stage_condition = self.blend_stage_condition(stage_condition_probs, z_hat, alpha)
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
@@ -1400,6 +1651,10 @@ class VLAFlowMatching(nn.Module):
         lang_masks,
         state,
         noise=None,
+        image_embs=None,
+        stage_images=None,
+        stage_img_masks=None,
+        stage_image_embs=None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
@@ -1417,8 +1672,23 @@ class VLAFlowMatching(nn.Module):
             lang_masks,
             state,
             use_cache=self.config.use_cache,
+            image_embs=image_embs,
         )
-        z_cond, _ = self.get_inference_stage_condition(prefix_hidden_states, prefix_pad_masks)
+        stage_prefix_hidden_states = prefix_hidden_states
+        stage_prefix_pad_masks = prefix_pad_masks
+        if self.should_use_stage_condition_at_inference() and stage_img_masks is not None and (
+            stage_image_embs is not None or stage_images is not None
+        ):
+            stage_prefix_hidden_states, stage_prefix_pad_masks, _ = self.encode_prefix_context(
+                stage_images,
+                stage_img_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                use_cache=False,
+                image_embs=stage_image_embs,
+            )
+        z_cond, _ = self.get_inference_stage_condition(stage_prefix_hidden_states, stage_prefix_pad_masks)
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
 
