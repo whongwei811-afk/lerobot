@@ -56,6 +56,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         force_cache_sync: bool = False,
         download_videos: bool = True,
         video_backend: str | None = None,
+        use_image_cache: bool = False,
+        image_cache_dir: str | Path | None = None,
+        build_image_cache: bool = True,
         batch_encoding_size: int = 1,
         vcodec: str = "libsvtav1",
         streaming_encoding: bool = False,
@@ -174,6 +177,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 True.
             video_backend (str | None, optional): Video backend to use for decoding videos. Defaults to torchcodec when available int the platform; otherwise, defaults to 'pyav'.
                 You can also use the 'pyav' decoder used by Torchvision, which used to be the default option, or 'video_reader' which is another decoder of Torchvision.
+            use_image_cache (bool, optional): If True, image-backed observations are read from a local
+                uint8 numpy memmap cache when possible. Defaults to False.
+            image_cache_dir (str | Path | None, optional): Directory used for image cache files. Defaults
+                to ``root / "image_cache"`` when image caching is enabled.
+            build_image_cache (bool, optional): If True, build the image cache when it is missing or stale.
+                Defaults to True.
             batch_encoding_size (int, optional): Number of episodes to accumulate before batch encoding videos.
                 Set to 1 for immediate encoding (default), or higher for batched encoding. Defaults to 1.
             vcodec (str, optional): Video codec for encoding videos during recording. Options: 'h264', 'hevc',
@@ -202,6 +211,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.tolerance_s = tolerance_s
         self.revision = revision if revision else CODEBASE_VERSION
         self._video_backend = video_backend if video_backend else get_safe_default_codec()
+        self._use_image_cache = use_image_cache
+        self._image_cache_dir = image_cache_dir
+        self._build_image_cache = build_image_cache
         self._batch_encoding_size = batch_encoding_size
         self._vcodec = resolve_vcodec(vcodec)
         self._encoder_threads = encoder_threads
@@ -225,6 +237,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
             video_backend=self._video_backend,
             delta_timestamps=delta_timestamps,
             image_transforms=image_transforms,
+            use_image_cache=use_image_cache,
+            image_cache_dir=image_cache_dir,
+            build_image_cache=build_image_cache,
         )
 
         # Load actual data
@@ -288,6 +303,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 video_backend=self._video_backend,
                 delta_timestamps=self.delta_timestamps,
                 image_transforms=self.image_transforms,
+                use_image_cache=self._use_image_cache,
+                image_cache_dir=self._image_cache_dir,
+                build_image_cache=self._build_image_cache,
             )
         return self.reader
 

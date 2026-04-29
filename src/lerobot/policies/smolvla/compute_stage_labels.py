@@ -189,6 +189,11 @@ class _ActionChunkDataset(Dataset[dict[str, Tensor]]):
         return torch.as_tensor(action_value)
 
     def _get_action_chunk(self, relative_indices: list[int]) -> Tensor:
+        cached_action = getattr(self.reader, "_delta_column_cache", {}).get(ACTION)
+        if cached_action is not None:
+            index_tensor = torch.as_tensor(relative_indices, dtype=torch.long, device=cached_action.device)
+            return cached_action.index_select(0, index_tensor)
+
         hf_dataset = self._get_hf_dataset()
         try:
             action_rows = hf_dataset[ACTION][relative_indices]

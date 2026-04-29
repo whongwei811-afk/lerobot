@@ -36,6 +36,9 @@ class DatasetConfig:
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_codec)
     streaming: bool = False
+    use_image_cache: bool = False
+    image_cache_dir: str | None = None
+    build_image_cache: bool = True
 
     def __post_init__(self) -> None:
         if self.episodes is not None:
