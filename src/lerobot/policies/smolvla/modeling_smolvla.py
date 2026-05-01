@@ -322,7 +322,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         }
         self._stage_image_embedding_queues = {}
         self._stage_image_mask_queues = {}
-        self._stage_context_queue = deque(maxlen=self.config.n_obs_steps)
+        self._stage_context_queue = deque(maxlen=max(0, self.config.n_obs_steps - 1))
         if self.config.n_obs_steps > 1:
             self._queues[OBS_STATE] = deque(maxlen=self.config.n_obs_steps)
             for key in self.config.image_features:
@@ -442,7 +442,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
         stage_images = None
         stage_img_masks = None
         stage_state = None
-        if self.config.use_stage_head and self.config.n_obs_steps > 1 and stage_context is None:
+        if (
+            self.config.use_stage_head
+            and self.config.n_obs_steps > 1
+            and stage_context is None
+            and not self._should_cache_inference_stage_context()
+        ):
             stage_images, stage_img_masks = self.prepare_stage_images(batch)
             stage_state = self.prepare_stage_state(batch)
         state = self.prepare_state(batch)
@@ -580,8 +585,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
             return False
         if not hasattr(self.model, "embed_images"):
             return False
-        if not hasattr(self.model, "encode_stage_step_context"):
-            return False
 
         should_use_stage_condition = getattr(self.model, "should_use_stage_condition_at_inference", None)
         if callable(should_use_stage_condition):
@@ -613,28 +616,16 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 f"got {len(current_image_embs)} embeddings for {len(present_img_keys)} features."
             )
 
-        current_state = self.prepare_state(batch)
-        lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
-        lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
-        current_stage_context = self.model.encode_stage_step_context(
-            current_images,
-            current_img_masks,
-            lang_tokens,
-            lang_masks,
-            current_state,
-            image_embs=current_image_embs,
-        ).detach()
+        expected_history_len = max(0, self.config.n_obs_steps - 1)
+        if (
+            not hasattr(self, "_stage_context_queue")
+            or self._stage_context_queue.maxlen != expected_history_len
+        ):
+            self._stage_context_queue = deque(maxlen=expected_history_len)
 
-        if not hasattr(self, "_stage_context_queue"):
-            self._stage_context_queue = deque(maxlen=self.config.n_obs_steps)
-
-        if len(self._stage_context_queue) != self._stage_context_queue.maxlen:
-            while len(self._stage_context_queue) != self._stage_context_queue.maxlen:
-                self._stage_context_queue.append(current_stage_context)
-        else:
-            self._stage_context_queue.append(current_stage_context)
-
-        stage_context = torch.cat(list(self._stage_context_queue), dim=-1)
+        stage_context = None
+        if len(self._stage_context_queue) > 0:
+            stage_context = torch.cat(list(self._stage_context_queue), dim=-1)
         return current_image_embs, current_img_masks, stage_context
 
     def _maybe_update_inference_image_embedding_cache(
@@ -741,6 +732,16 @@ class SmolVLAPolicy(PreTrainedPolicy):
             cached_outputs["stage_context"] = stage_outputs["stage_context"].detach()
             cached_outputs["inference_p_global_mean"] = stage_outputs["stage_probs"][:, 0].mean().detach()
             cached_outputs["inference_p_local_mean"] = stage_outputs["stage_probs"][:, 1].mean().detach()
+
+        current_stage_context = inference_outputs.get("current_stage_context")
+        if isinstance(current_stage_context, Tensor) and self.config.n_obs_steps > 1:
+            expected_history_len = self.config.n_obs_steps - 1
+            if (
+                not hasattr(self, "_stage_context_queue")
+                or self._stage_context_queue.maxlen != expected_history_len
+            ):
+                self._stage_context_queue = deque(maxlen=expected_history_len)
+            self._stage_context_queue.append(current_stage_context.detach())
 
         z_cond = inference_outputs.get("z_cond")
         if z_cond is not None:
@@ -1376,6 +1377,48 @@ class VLAFlowMatching(nn.Module):
         )
         return self.pool_stage_context(prefix_hidden, prefix_masks)
 
+    def combine_stage_history_with_current(
+        self, stage_context: Tensor | None, current_context: Tensor
+    ) -> Tensor:
+        if current_context.ndim != 2:
+            raise ValueError(
+                f"`current_context` must have shape [batch_size, hidden_size], got {tuple(current_context.shape)}."
+            )
+
+        history_len = self.config.n_obs_steps
+        if history_len <= 1:
+            return current_context
+
+        context_dim = current_context.shape[-1]
+        history_contexts: list[Tensor] = []
+        if stage_context is not None:
+            if stage_context.ndim != 2:
+                raise ValueError(
+                    f"`stage_context` must have shape [batch_size, steps * hidden_size], got {tuple(stage_context.shape)}."
+                )
+            if stage_context.shape[0] != current_context.shape[0]:
+                raise ValueError(
+                    "`stage_context` and `current_context` must have the same batch size, got "
+                    f"{stage_context.shape[0]} and {current_context.shape[0]}."
+                )
+            if stage_context.shape[-1] % context_dim != 0:
+                raise ValueError(
+                    "`stage_context` width must be divisible by the current context width, got "
+                    f"{stage_context.shape[-1]} and {context_dim}."
+                )
+            history_contexts = list(stage_context.split(context_dim, dim=-1))
+            if len(history_contexts) == history_len:
+                history_contexts = history_contexts[: history_len - 1]
+            elif len(history_contexts) > history_len - 1:
+                history_contexts = history_contexts[-(history_len - 1) :]
+
+        missing_history = history_len - 1 - len(history_contexts)
+        if missing_history > 0:
+            pad_context = history_contexts[0] if len(history_contexts) > 0 else current_context
+            history_contexts = [pad_context] * missing_history + history_contexts
+
+        return torch.cat([*history_contexts, current_context], dim=-1)
+
     def encode_stage_history_context(
         self,
         images,
@@ -1385,6 +1428,7 @@ class VLAFlowMatching(nn.Module):
         stage_state: Tensor,
         *,
         image_embs: list[Tensor] | None = None,
+        current_context: Tensor | None = None,
     ) -> Tensor:
         if stage_state.ndim != 3:
             raise ValueError(f"`stage_state` must have shape [B, T, D], got {tuple(stage_state.shape)}.")
@@ -1407,7 +1451,8 @@ class VLAFlowMatching(nn.Module):
 
         images_per_step = len(img_masks) // history_len
         contexts = []
-        for step_idx in range(history_len):
+        steps_to_encode = history_len if current_context is None else history_len - 1
+        for step_idx in range(steps_to_encode):
             start = step_idx * images_per_step
             end = start + images_per_step
             step_image_embs = image_embs[start:end] if image_embs is not None else None
@@ -1422,7 +1467,12 @@ class VLAFlowMatching(nn.Module):
                 )
             )
 
-        return torch.cat(contexts, dim=-1)
+        stage_context = torch.cat(contexts, dim=-1) if len(contexts) > 0 else None
+        if current_context is not None:
+            return self.combine_stage_history_with_current(stage_context, current_context)
+        if stage_context is None:
+            raise ValueError("Stage history context requires at least one encoded context.")
+        return stage_context
 
     def embed_prefix(
         self,
@@ -1756,6 +1806,7 @@ class VLAFlowMatching(nn.Module):
         )
         stage_outputs = None
         if self.config.use_stage_head and self.stage_head is not None:
+            current_stage_context = self.pool_stage_context(prefix_out, prefix_pad_masks)
             if stage_context is None and stage_images is not None and stage_img_masks is not None:
                 if stage_state is None:
                     raise ValueError("Stage history prediction requires `stage_state`.")
@@ -1765,6 +1816,7 @@ class VLAFlowMatching(nn.Module):
                     lang_tokens,
                     lang_masks,
                     stage_state,
+                    current_context=current_stage_context,
                 )
             elif stage_context is None:
                 if self.config.n_obs_steps != 1:
@@ -1772,7 +1824,11 @@ class VLAFlowMatching(nn.Module):
                         "Stage history prediction requires `stage_state` and `stage_images` when "
                         "`n_obs_steps > 1`."
                     )
-                stage_context = self.pool_stage_context(prefix_out, prefix_pad_masks)
+                stage_context = current_stage_context
+            else:
+                stage_context = self.combine_stage_history_with_current(
+                    stage_context, current_stage_context
+                )
             stage_outputs = self.predict_stage_from_context(stage_context)
         z_hat = stage_outputs["stage_probs"] if stage_outputs is not None else None
         _ = stage_condition_probs
@@ -1875,23 +1931,28 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             image_embs=image_embs,
         )
-        if (
-            self.should_use_stage_condition_at_inference()
-            and stage_img_masks is not None
-            and (stage_image_embs is not None or stage_images is not None)
-        ):
-            if stage_state is None:
-                raise ValueError("Stage history inference requires `stage_state`.")
-            stage_context = self.encode_stage_history_context(
-                stage_images,
-                stage_img_masks,
-                lang_tokens,
-                lang_masks,
-                stage_state,
-                image_embs=stage_image_embs,
-            )
-        if stage_context is not None:
+        current_stage_context = None
+        if self.should_use_stage_condition_at_inference():
+            current_stage_context = self.pool_stage_context(prefix_hidden_states, prefix_pad_masks)
+            if stage_img_masks is not None and stage_images is not None:
+                if stage_state is None:
+                    raise ValueError("Stage history inference requires `stage_state`.")
+                stage_context = self.encode_stage_history_context(
+                    stage_images,
+                    stage_img_masks,
+                    lang_tokens,
+                    lang_masks,
+                    stage_state,
+                    image_embs=stage_image_embs,
+                    current_context=current_stage_context,
+                )
+            else:
+                stage_context = self.combine_stage_history_with_current(
+                    stage_context, current_stage_context
+                )
             z_cond, _ = self.get_inference_stage_condition_from_context(stage_context)
+            if self._last_inference_stage_output is not None and current_stage_context is not None:
+                self._last_inference_stage_output["current_stage_context"] = current_stage_context.detach()
         else:
             z_cond, _ = self.get_inference_stage_condition(prefix_hidden_states, prefix_pad_masks)
         stage_alpha = self.config.alpha_end if self.config.use_alpha_schedule else self.config.alpha_start
