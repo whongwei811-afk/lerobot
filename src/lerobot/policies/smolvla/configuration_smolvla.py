@@ -118,7 +118,7 @@ class SmolVLAConfig(PreTrainedConfig):
     stage_loss_weight: float = 0.1
     stage_pooling: str = "last_state_token"
 
-    # Optional teacher stage conditioning on the action branch.
+    # Optional predicted-stage conditioning on the action branch.
     use_stage_conditioned_action: bool = False
     stage_condition_mode: str = "film"
     stage_condition_hidden_dim: int = 128
@@ -128,11 +128,11 @@ class SmolVLAConfig(PreTrainedConfig):
     action_large_scale_kernel: int = 5
     train_metric_window_size: int = 100
     use_alpha_schedule: bool = True
-    alpha_schedule: str = "cosine"
+    alpha_schedule: str = "linear"
     alpha_start: float = 0.0
-    alpha_end: float = 1.0
-    alpha_warmup_steps: int = 10_000
-    alpha_hold_steps: int = 0
+    alpha_end: float = 0.3
+    alpha_warmup_steps: int = 30_000
+    alpha_hold_steps: int = 30_000
     detach_pred_stage_for_action: bool = True
     use_stage_condition_at_inference: bool = True
     inference_stage_source: str = "predicted"

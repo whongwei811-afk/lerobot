@@ -279,8 +279,7 @@ class StageFiLM(nn.Module):
         nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, z_cond: Tensor) -> tuple[Tensor, Tensor]:
-        gamma_delta, beta = self.mlp(z_cond).chunk(2, dim=-1)
-        gamma = 1.0 + gamma_delta
+        gamma, beta = self.mlp(z_cond).chunk(2, dim=-1)
         return gamma, beta
 
 
@@ -323,6 +322,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         }
         self._stage_image_embedding_queues = {}
         self._stage_image_mask_queues = {}
+        self._stage_context_queue = deque(maxlen=self.config.n_obs_steps)
         if self.config.n_obs_steps > 1:
             self._queues[OBS_STATE] = deque(maxlen=self.config.n_obs_steps)
             for key in self.config.image_features:
@@ -405,6 +405,16 @@ class SmolVLAPolicy(PreTrainedPolicy):
         alpha_max = max(self.config.alpha_start, self.config.alpha_end)
         return float(max(alpha_min, min(alpha, alpha_max)))
 
+    def configure_training_steps(self, total_steps: int) -> None:
+        total_steps = max(1, int(total_steps))
+        hold_steps = int(total_steps * 0.2)
+        warmup_end_steps = int(total_steps * 0.6)
+        self.config.alpha_hold_steps = hold_steps
+        self.config.alpha_warmup_steps = max(1, warmup_end_steps - hold_steps)
+
+    def should_integrate_stage_condition(self) -> bool:
+        return self.config.use_stage_conditioned_action
+
     def blend_stage_condition(self, z: Tensor | None, z_hat: Tensor | None, alpha: float) -> Tensor | None:
         return self.model.blend_stage_condition(z, z_hat, alpha)
 
@@ -414,8 +424,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         noise: Tensor | None = None,
         image_embs: list[Tensor] | None = None,
         current_img_masks: list[Tensor] | None = None,
-        stage_image_embs: list[Tensor] | None = None,
-        cached_stage_img_masks: list[Tensor] | None = None,
+        stage_context: Tensor | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         # TODO: Check if this for loop is needed.
@@ -432,11 +441,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
             img_masks = current_img_masks
         stage_images = None
         stage_img_masks = None
-        if self.config.use_stage_head and self.config.n_obs_steps > 1:
-            if stage_image_embs is not None and cached_stage_img_masks is not None:
-                stage_img_masks = cached_stage_img_masks
-            else:
-                stage_images, stage_img_masks = self.prepare_images(batch, use_history=True)
+        stage_state = None
+        if self.config.use_stage_head and self.config.n_obs_steps > 1 and stage_context is None:
+            stage_images, stage_img_masks = self.prepare_stage_images(batch)
+            stage_state = self.prepare_stage_state(batch)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
@@ -451,7 +459,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
             image_embs=image_embs,
             stage_images=stage_images,
             stage_img_masks=stage_img_masks,
-            stage_image_embs=stage_image_embs,
+            stage_state=stage_state,
+            stage_context=stage_context,
             **kwargs,
         )
         self._cache_inference_stage_head_output()
@@ -479,17 +488,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         batch = self._prepare_batch(batch)
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
-        image_embs, current_img_masks, stage_image_embs, cached_stage_img_masks = (
-            self._maybe_update_inference_image_embedding_cache(batch)
-        )
+        image_embs, current_img_masks, stage_context = self._maybe_update_inference_stage_context_cache(batch)
 
         actions = self._get_action_chunk(
             batch,
             noise,
             image_embs=image_embs,
             current_img_masks=current_img_masks,
-            stage_image_embs=stage_image_embs,
-            cached_stage_img_masks=cached_stage_img_masks,
+            stage_context=stage_context,
             **kwargs,
         )
         return actions
@@ -512,9 +518,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self.eval()
         batch = self._prepare_batch(batch)
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
-        image_embs, current_img_masks, stage_image_embs, cached_stage_img_masks = (
-            self._maybe_update_inference_image_embedding_cache(batch)
-        )
+        image_embs, current_img_masks, stage_context = self._maybe_update_inference_stage_context_cache(batch)
 
         if self._check_get_actions_condition():
             actions = self._get_action_chunk(
@@ -522,8 +526,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 noise,
                 image_embs=image_embs,
                 current_img_masks=current_img_masks,
-                stage_image_embs=stage_image_embs,
-                cached_stage_img_masks=cached_stage_img_masks,
+                stage_context=stage_context,
             )
 
             # `self.predict_action_chunk` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
@@ -572,10 +575,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
             action_steps, dtype=torch.long, device=device
         )
 
-    def _should_cache_inference_image_embeddings(self) -> bool:
+    def _should_cache_inference_stage_context(self) -> bool:
         if not (self.config.use_stage_head and self.config.n_obs_steps > 1):
             return False
         if not hasattr(self.model, "embed_images"):
+            return False
+        if not hasattr(self.model, "encode_stage_step_context"):
             return False
 
         should_use_stage_condition = getattr(self.model, "should_use_stage_condition_at_inference", None)
@@ -583,20 +588,23 @@ class SmolVLAPolicy(PreTrainedPolicy):
             return bool(should_use_stage_condition())
         return bool(self.config.use_stage_condition_at_inference)
 
-    def _maybe_update_inference_image_embedding_cache(
+    def _should_cache_inference_image_embeddings(self) -> bool:
+        return self._should_cache_inference_stage_context()
+
+    def _maybe_update_inference_stage_context_cache(
         self, batch: dict[str, Tensor]
-    ) -> tuple[list[Tensor] | None, list[Tensor] | None, list[Tensor] | None, list[Tensor] | None]:
-        if not self._should_cache_inference_image_embeddings():
-            return None, None, None, None
+    ) -> tuple[list[Tensor] | None, list[Tensor] | None, Tensor | None]:
+        if not self._should_cache_inference_stage_context():
+            return None, None, None
 
         present_img_keys = [key for key in self.config.image_features if key in batch]
         missing_img_keys = [key for key in self.config.image_features if key not in batch]
         if len(present_img_keys) == 0 or len(missing_img_keys) > 0:
-            return None, None, None, None
+            return None, None, None
 
         current_images, current_img_masks = self.prepare_images(batch)
         if len(current_images) != len(present_img_keys):
-            return None, None, None, None
+            return None, None, None
 
         current_image_embs = self.model.embed_images(current_images)
         if len(current_image_embs) != len(present_img_keys):
@@ -605,26 +613,35 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 f"got {len(current_image_embs)} embeddings for {len(present_img_keys)} features."
             )
 
-        for key, image_emb, img_mask in zip(
-            present_img_keys, current_image_embs, current_img_masks, strict=False
-        ):
-            embedding_queue = self._stage_image_embedding_queues.get(key)
-            mask_queue = self._stage_image_mask_queues.get(key)
-            if embedding_queue is None or mask_queue is None:
-                return None, None, None, None
+        current_state = self.prepare_state(batch)
+        lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
+        lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        current_stage_context = self.model.encode_stage_step_context(
+            current_images,
+            current_img_masks,
+            lang_tokens,
+            lang_masks,
+            current_state,
+            image_embs=current_image_embs,
+        ).detach()
 
-            image_emb = image_emb.detach()
-            img_mask = img_mask.detach()
-            if len(embedding_queue) != embedding_queue.maxlen:
-                while len(embedding_queue) != embedding_queue.maxlen:
-                    embedding_queue.append(image_emb)
-                    mask_queue.append(img_mask)
-            else:
-                embedding_queue.append(image_emb)
-                mask_queue.append(img_mask)
+        if not hasattr(self, "_stage_context_queue"):
+            self._stage_context_queue = deque(maxlen=self.config.n_obs_steps)
 
-        stage_image_embs, stage_img_masks = self._get_cached_stage_image_embeddings(present_img_keys)
-        return current_image_embs, current_img_masks, stage_image_embs, stage_img_masks
+        if len(self._stage_context_queue) != self._stage_context_queue.maxlen:
+            while len(self._stage_context_queue) != self._stage_context_queue.maxlen:
+                self._stage_context_queue.append(current_stage_context)
+        else:
+            self._stage_context_queue.append(current_stage_context)
+
+        stage_context = torch.cat(list(self._stage_context_queue), dim=-1)
+        return current_image_embs, current_img_masks, stage_context
+
+    def _maybe_update_inference_image_embedding_cache(
+        self, batch: dict[str, Tensor]
+    ) -> tuple[list[Tensor] | None, list[Tensor] | None, list[Tensor] | None, list[Tensor] | None]:
+        current_image_embs, current_img_masks, _ = self._maybe_update_inference_stage_context_cache(batch)
+        return current_image_embs, current_img_masks, None, None
 
     def _get_cached_stage_image_embeddings(
         self, image_keys: list[str]
@@ -819,8 +836,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
         images, img_masks = self.prepare_images(batch)
         stage_images = None
         stage_img_masks = None
+        stage_state = None
         if self.config.use_stage_head and self.config.n_obs_steps > 1:
-            stage_images, stage_img_masks = self.prepare_images(batch, use_history=True)
+            stage_images, stage_img_masks = self.prepare_stage_images(batch)
+            stage_state = self.prepare_stage_state(batch)
         state = self.prepare_state(batch)
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
@@ -828,6 +847,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
         stage_label_probs = self._maybe_get_batch_stage_probs(batch, device=actions.device)
         actions_is_pad = batch.get("action_is_pad")
         alpha = self.compute_alpha()
+        stage_kwargs = {}
+        if stage_state is not None:
+            stage_kwargs["stage_state"] = stage_state
         losses, model_outputs = self.model.forward(
             images,
             img_masks,
@@ -837,10 +859,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
             actions,
             noise,
             time,
-            stage_condition_probs=stage_label_probs,
+            stage_condition_probs=None,
             stage_images=stage_images,
             stage_img_masks=stage_img_masks,
             alpha=alpha,
+            condition_stage_action=self.config.use_stage_conditioned_action,
+            **stage_kwargs,
         )
         stage_outputs = model_outputs.get("stage_outputs") if model_outputs is not None else None
         stage_loss_per_sample = None
@@ -894,7 +918,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 z_cond[:, 0] * l_large_per_sample + z_cond[:, 1] * l_small_per_sample
             )
             action_loss_per_sample = (
-                fm_loss_per_sample + self.config.action_multiscale_loss_weight * action_multiscale_per_sample
+                fm_loss_per_sample
+                + alpha * self.config.action_multiscale_loss_weight * action_multiscale_per_sample
             )
         else:
             action_loss_per_sample = fm_loss_per_sample
@@ -1008,6 +1033,78 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 images.append(img)
                 img_masks.append(mask)
         return images, img_masks
+
+    def prepare_stage_state(self, batch: dict[str, Tensor]) -> Tensor:
+        raw_state = batch[OBS_STATE]
+        if self.config.n_obs_steps == 1:
+            state = raw_state[:, -1, :] if raw_state.ndim > 2 else raw_state
+            return pad_vector(state[:, None, :], self.config.max_state_dim)
+
+        if raw_state.ndim != 3:
+            raise ValueError(
+                "`n_obs_steps > 1` requires historical state with shape "
+                f"[batch_size, {self.config.n_obs_steps}, state_dim], got {tuple(raw_state.shape)}."
+            )
+        if raw_state.shape[1] != self.config.n_obs_steps:
+            raise ValueError(
+                f"Expected {self.config.n_obs_steps} state history steps, got {raw_state.shape[1]}."
+            )
+        return pad_vector(raw_state, self.config.max_state_dim)
+
+    def prepare_stage_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
+        if self.config.n_obs_steps == 1:
+            return self.prepare_images(batch)
+
+        images_by_step: list[list[Tensor]] = [[] for _ in range(self.config.n_obs_steps)]
+        masks_by_step: list[list[Tensor]] = [[] for _ in range(self.config.n_obs_steps)]
+        present_img_keys = [key for key in self.config.image_features if key in batch]
+        missing_img_keys = [key for key in self.config.image_features if key not in batch]
+
+        if len(present_img_keys) == 0:
+            raise ValueError(
+                f"All image features are missing from the batch. At least one expected. (batch: {batch.keys()}) (image_features:{self.config.image_features})"
+            )
+
+        for key in present_img_keys:
+            raw_img = batch[key]
+            if raw_img.ndim != 5:
+                raise ValueError(
+                    "`n_obs_steps > 1` requires historical images with shape "
+                    f"[batch_size, {self.config.n_obs_steps}, channels, height, width], got {tuple(raw_img.shape)}."
+                )
+            if raw_img.shape[1] != self.config.n_obs_steps:
+                raise ValueError(
+                    f"Expected {self.config.n_obs_steps} image history steps for '{key}', got {raw_img.shape[1]}."
+                )
+
+            bsize = raw_img.shape[0]
+            valid_mask = self._get_image_valid_mask(
+                batch, key, bsize, raw_img.device, num_frames=raw_img.shape[1]
+            )
+            if valid_mask.ndim == 2:
+                frame_masks = list(valid_mask.unbind(dim=1))
+            else:
+                frame_masks = [valid_mask] * raw_img.shape[1]
+
+            for step_idx, (img, mask) in enumerate(zip(raw_img.unbind(dim=1), frame_masks, strict=False)):
+                if self.config.resize_imgs_with_padding is not None:
+                    img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
+                images_by_step[step_idx].append(img * 2.0 - 1.0)
+                masks_by_step[step_idx].append(mask)
+
+        for num_empty_cameras in range(len(missing_img_keys)):
+            if num_empty_cameras >= self.config.empty_cameras:
+                break
+            for step_idx in range(self.config.n_obs_steps):
+                img = torch.ones_like(images_by_step[step_idx][0]) * -1
+                mask = torch.zeros_like(masks_by_step[step_idx][0])
+                images_by_step[step_idx].append(img)
+                masks_by_step[step_idx].append(mask)
+
+        return (
+            [img for step_images in images_by_step for img in step_images],
+            [mask for step_masks in masks_by_step for mask in step_masks],
+        )
 
     def _pi_aloha_decode_state(self, state):
         # Flip the joints.
@@ -1152,11 +1249,7 @@ class VLAFlowMatching(nn.Module):
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
         self.stage_head = None
-        if self.config.use_stage_head:
-            self.stage_head = StageHead(
-                self.vlm_with_expert.config.text_config.hidden_size,
-                self.config.stage_head_hidden_dim,
-            )
+        self._init_stage_head()
         self.stage_film = None
         if self.config.use_stage_conditioned_action:
             self.stage_film = StageFiLM(
@@ -1191,6 +1284,15 @@ class VLAFlowMatching(nn.Module):
     def last_inference_stage_output(self) -> dict[str, object] | None:
         return self._last_inference_stage_output
 
+    def _init_stage_head(self) -> None:
+        self.stage_head = None
+        if self.config.use_stage_head:
+            hidden_size = self.vlm_with_expert.config.text_config.hidden_size
+            self.stage_head = StageHead(
+                hidden_size * self.config.n_obs_steps,
+                self.config.stage_head_hidden_dim,
+            )
+
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
             params.requires_grad = self.config.train_state_proj
@@ -1212,33 +1314,19 @@ class VLAFlowMatching(nn.Module):
         return time
 
     def embed_images(self, images) -> list[Tensor]:
-        """Embed image tensors in shape-compatible batches while preserving prefix order."""
-        if len(images) == 0:
-            return []
-
-        image_embs: list[Tensor | None] = [None] * len(images)
-        image_groups: dict[tuple[torch.device, torch.dtype, tuple[int, ...]], list[int]] = {}
-        for image_idx, image in enumerate(images):
-            group_key = (image.device, image.dtype, tuple(image.shape[1:]))
-            image_groups.setdefault(group_key, []).append(image_idx)
-
-        for image_indices in image_groups.values():
-            batched_images = torch.cat([images[image_idx] for image_idx in image_indices], dim=0)
-            batched_embs = self.vlm_with_expert.embed_image(batched_images)
+        """Embed image tensors one at a time while preserving prefix order."""
+        image_embs = []
+        for image in images:
+            image_emb = self.vlm_with_expert.embed_image(image)
 
             # Normalize image embeddings.
-            img_emb_dim = batched_embs.shape[-1]
-            batched_embs = batched_embs * torch.tensor(
-                img_emb_dim**0.5, dtype=batched_embs.dtype, device=batched_embs.device
+            img_emb_dim = image_emb.shape[-1]
+            image_emb = image_emb * torch.tensor(
+                img_emb_dim**0.5, dtype=image_emb.dtype, device=image_emb.device
             )
+            image_embs.append(image_emb)
 
-            split_sizes = [images[image_idx].shape[0] for image_idx in image_indices]
-            for image_idx, image_emb in zip(
-                image_indices, batched_embs.split(split_sizes, dim=0), strict=False
-            ):
-                image_embs[image_idx] = image_emb
-
-        return [image_emb for image_emb in image_embs if image_emb is not None]
+        return image_embs
 
     def encode_prefix_context(
         self,
@@ -1266,6 +1354,75 @@ class VLAFlowMatching(nn.Module):
         )
         prefix_hidden_states = prefix_outputs[0]
         return prefix_hidden_states, prefix_pad_masks, past_key_values
+
+    def encode_stage_step_context(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state: Tensor,
+        *,
+        image_embs: list[Tensor] | None = None,
+    ) -> Tensor:
+        prefix_hidden, prefix_masks, _ = self.encode_prefix_context(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            use_cache=False,
+            image_embs=image_embs,
+        )
+        return self.pool_stage_context(prefix_hidden, prefix_masks)
+
+    def encode_stage_history_context(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        stage_state: Tensor,
+        *,
+        image_embs: list[Tensor] | None = None,
+    ) -> Tensor:
+        if stage_state.ndim != 3:
+            raise ValueError(f"`stage_state` must have shape [B, T, D], got {tuple(stage_state.shape)}.")
+
+        history_len = self.config.n_obs_steps
+        if stage_state.shape[1] != history_len:
+            raise ValueError(f"Expected {history_len} state history steps, got {stage_state.shape[1]}.")
+        if len(images) != len(img_masks):
+            raise ValueError(
+                f"Stage images and masks must have the same length, got {len(images)} and {len(img_masks)}."
+            )
+        if len(img_masks) % history_len != 0:
+            raise ValueError(
+                f"Stage image masks length {len(img_masks)} is not divisible by history length {history_len}."
+            )
+        if image_embs is not None and len(image_embs) != len(img_masks):
+            raise ValueError(
+                f"Stage image embeddings and masks must have the same length, got {len(image_embs)} and {len(img_masks)}."
+            )
+
+        images_per_step = len(img_masks) // history_len
+        contexts = []
+        for step_idx in range(history_len):
+            start = step_idx * images_per_step
+            end = start + images_per_step
+            step_image_embs = image_embs[start:end] if image_embs is not None else None
+            contexts.append(
+                self.encode_stage_step_context(
+                    images[start:end],
+                    img_masks[start:end],
+                    lang_tokens,
+                    lang_masks,
+                    stage_state[:, step_idx, :],
+                    image_embs=step_image_embs,
+                )
+            )
+
+        return torch.cat(contexts, dim=-1)
 
     def embed_prefix(
         self,
@@ -1316,9 +1473,7 @@ class VLAFlowMatching(nn.Module):
             att_masks += [0] * (num_img_embs)
             if self.add_image_special_tokens:
                 image_end_token = (
-                    self.vlm_with_expert.embed_language_tokens(
-                        self.image_end_token.to(device=img_emb.device)
-                    )
+                    self.vlm_with_expert.embed_language_tokens(self.image_end_token.to(device=img_emb.device))
                     .unsqueeze(0)
                     .expand(bsize, -1, -1)
                 )
@@ -1431,6 +1586,12 @@ class VLAFlowMatching(nn.Module):
             return None
 
         stage_context = self.pool_stage_context(prefix_hidden_states, prefix_pad_masks)
+        return self.predict_stage_from_context(stage_context)
+
+    def predict_stage_from_context(self, stage_context: Tensor) -> StageHeadOutput | None:
+        if not self.config.use_stage_head or self.stage_head is None:
+            return None
+
         stage_logits = self.stage_head(stage_context).to(dtype=torch.float32)
         stage_probs = torch.softmax(stage_logits, dim=-1)
         return {
@@ -1480,37 +1641,54 @@ class VLAFlowMatching(nn.Module):
         }
         return z_cond, stage_outputs
 
+    def get_inference_stage_condition_from_context(
+        self, stage_context: Tensor
+    ) -> tuple[Tensor | None, StageHeadOutput | None]:
+        self._last_inference_stage_output = None
+        if not self.should_use_stage_condition_at_inference():
+            return None, None
+
+        stage_outputs = self.predict_stage_from_context(stage_context)
+        if stage_outputs is None:
+            return None, None
+
+        z_hat = stage_outputs["stage_probs"]
+        if z_hat.ndim != 2 or z_hat.shape[-1] != 2:
+            raise ValueError(
+                f"Predicted stage probabilities must have shape [batch_size, 2], got {tuple(z_hat.shape)}."
+            )
+
+        z_cond = z_hat.to(dtype=torch.float32)
+        self._last_inference_stage_output = {
+            "stage_outputs": stage_outputs,
+            "z_cond": z_cond,
+        }
+        return z_cond, stage_outputs
+
     def blend_stage_condition(self, z: Tensor | None, z_hat: Tensor | None, alpha: float) -> Tensor | None:
-        if z is None:
+        _ = (z, alpha)
+        if z_hat is None:
             return None
 
-        z = z.to(dtype=torch.float32)
-        if z_hat is None:
-            return z
-
         z_hat_for_action = z_hat.detach() if self.config.detach_pred_stage_for_action else z_hat
-        z_hat_for_action = z_hat_for_action.to(device=z.device, dtype=z.dtype)
-        alpha_tensor = z.new_tensor(alpha)
-        z_cond = (1.0 - alpha_tensor) * z + alpha_tensor * z_hat_for_action
-        return z_cond
+        return z_hat_for_action.to(dtype=torch.float32)
 
     def apply_stage_condition(
-        self, action_hidden: Tensor, z_cond: Tensor | None
+        self, action_hidden: Tensor, z_cond: Tensor | None, alpha: float = 1.0
     ) -> tuple[Tensor, Tensor | None]:
         if not self.config.use_stage_conditioned_action or self.stage_film is None:
             return action_hidden, None
 
         if z_cond is None:
-            z_cond = torch.full(
-                (action_hidden.shape[0], 2), 0.5, dtype=torch.float32, device=action_hidden.device
-            )
-        else:
-            z_cond = z_cond.to(device=action_hidden.device, dtype=torch.float32)
+            return action_hidden, None
+
+        z_cond = z_cond.to(device=action_hidden.device, dtype=torch.float32)
 
         gamma, beta = self.stage_film(z_cond)
         gamma = gamma.to(dtype=action_hidden.dtype).unsqueeze(1)
         beta = beta.to(dtype=action_hidden.dtype).unsqueeze(1)
-        conditioned_hidden = gamma * action_hidden + beta
+        alpha_tensor = action_hidden.new_tensor(alpha)
+        conditioned_hidden = action_hidden * (1.0 + alpha_tensor * gamma) + alpha_tensor * beta
         return conditioned_hidden, z_cond
 
     def decompose_action_scales(self, action_chunk: Tensor) -> tuple[Tensor, Tensor]:
@@ -1553,7 +1731,10 @@ class VLAFlowMatching(nn.Module):
         stage_condition_probs: Tensor | None = None,
         stage_images=None,
         stage_img_masks=None,
+        stage_state: Tensor | None = None,
+        stage_context: Tensor | None = None,
         alpha: float = 0.0,
+        condition_stage_action: bool = True,
     ) -> tuple[Tensor, ActionConditionedOutput | None]:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -1575,22 +1756,36 @@ class VLAFlowMatching(nn.Module):
         )
         stage_outputs = None
         if self.config.use_stage_head and self.stage_head is not None:
-            stage_prefix_out = prefix_out
-            stage_prefix_pad_masks = prefix_pad_masks
-            if stage_images is not None and stage_img_masks is not None:
-                stage_prefix_out, stage_prefix_pad_masks, _ = self.encode_prefix_context(
+            if stage_context is None and stage_images is not None and stage_img_masks is not None:
+                if stage_state is None:
+                    raise ValueError("Stage history prediction requires `stage_state`.")
+                stage_context = self.encode_stage_history_context(
                     stage_images,
                     stage_img_masks,
                     lang_tokens,
                     lang_masks,
-                    state,
-                    use_cache=False,
+                    stage_state,
                 )
-            stage_outputs = self.predict_stage(stage_prefix_out, stage_prefix_pad_masks)
+            elif stage_context is None:
+                if self.config.n_obs_steps != 1:
+                    raise ValueError(
+                        "Stage history prediction requires `stage_state` and `stage_images` when "
+                        "`n_obs_steps > 1`."
+                    )
+                stage_context = self.pool_stage_context(prefix_out, prefix_pad_masks)
+            stage_outputs = self.predict_stage_from_context(stage_context)
         z_hat = stage_outputs["stage_probs"] if stage_outputs is not None else None
-        blended_stage_condition = self.blend_stage_condition(stage_condition_probs, z_hat, alpha)
+        _ = stage_condition_probs
+        action_stage_condition = (
+            self.blend_stage_condition(None, z_hat, alpha) if condition_stage_action else None
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
-        conditioned_suffix_embs, z_cond = self.apply_stage_condition(suffix_embs, blended_stage_condition)
+        if condition_stage_action:
+            conditioned_suffix_embs, z_cond = self.apply_stage_condition(
+                suffix_embs, action_stage_condition, alpha=alpha
+            )
+        else:
+            conditioned_suffix_embs, z_cond = suffix_embs, None
         model_outputs: ActionConditionedOutput | None = None
         if self.config.use_stage_conditioned_action:
             model_outputs = {
@@ -1632,7 +1827,11 @@ class VLAFlowMatching(nn.Module):
         action_pred = noise - v_t
         if model_outputs is not None and self.config.use_stage_conditioned_action:
             model_outputs["action_pred"] = action_pred
-        if self.config.use_stage_conditioned_action and self.config.use_multiscale_action_loss:
+        if (
+            condition_stage_action
+            and self.config.use_stage_conditioned_action
+            and self.config.use_multiscale_action_loss
+        ):
             l_large_elementwise, l_small_elementwise = self.compute_multiscale_action_loss(
                 action_pred, actions
             )
@@ -1654,7 +1853,9 @@ class VLAFlowMatching(nn.Module):
         image_embs=None,
         stage_images=None,
         stage_img_masks=None,
+        stage_state: Tensor | None = None,
         stage_image_embs=None,
+        stage_context: Tensor | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
@@ -1674,21 +1875,26 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             image_embs=image_embs,
         )
-        stage_prefix_hidden_states = prefix_hidden_states
-        stage_prefix_pad_masks = prefix_pad_masks
-        if self.should_use_stage_condition_at_inference() and stage_img_masks is not None and (
-            stage_image_embs is not None or stage_images is not None
+        if (
+            self.should_use_stage_condition_at_inference()
+            and stage_img_masks is not None
+            and (stage_image_embs is not None or stage_images is not None)
         ):
-            stage_prefix_hidden_states, stage_prefix_pad_masks, _ = self.encode_prefix_context(
+            if stage_state is None:
+                raise ValueError("Stage history inference requires `stage_state`.")
+            stage_context = self.encode_stage_history_context(
                 stage_images,
                 stage_img_masks,
                 lang_tokens,
                 lang_masks,
-                state,
-                use_cache=False,
+                stage_state,
                 image_embs=stage_image_embs,
             )
-        z_cond, _ = self.get_inference_stage_condition(stage_prefix_hidden_states, stage_prefix_pad_masks)
+        if stage_context is not None:
+            z_cond, _ = self.get_inference_stage_condition_from_context(stage_context)
+        else:
+            z_cond, _ = self.get_inference_stage_condition(prefix_hidden_states, prefix_pad_masks)
+        stage_alpha = self.config.alpha_end if self.config.use_alpha_schedule else self.config.alpha_start
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
 
@@ -1704,6 +1910,7 @@ class VLAFlowMatching(nn.Module):
                     past_key_values=past_key_values,
                     timestep=current_timestep,
                     z_cond=z_cond,
+                    alpha=stage_alpha,
                 )
 
             if self._rtc_enabled():
@@ -1736,10 +1943,11 @@ class VLAFlowMatching(nn.Module):
         x_t,
         timestep,
         z_cond: Tensor | None = None,
+        alpha: float = 1.0,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
-        conditioned_suffix_embs, _ = self.apply_stage_condition(suffix_embs, z_cond=z_cond)
+        conditioned_suffix_embs, _ = self.apply_stage_condition(suffix_embs, z_cond=z_cond, alpha=alpha)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]

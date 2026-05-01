@@ -252,6 +252,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         ds_meta=dataset.meta,
         rename_map=cfg.rename_map,
     )
+    if has_method(policy, "configure_training_steps"):
+        policy.configure_training_steps(cfg.steps)
 
     if cfg.peft is not None:
         logging.info("Using PEFT! Wrapping model.")

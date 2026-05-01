@@ -399,6 +399,10 @@ class DatasetReader:
                 if self._absolute_to_relative_idx is None
                 else [self._absolute_to_relative_idx[idx] for idx in q_idx]
             )
+            cached_images = self._image_cache.get(key)
+            if cached_images is not None:
+                result[key] = torch.from_numpy(np.asarray(cached_images[relative_indices]).copy()).float() / 255.0
+                continue
             cached_column = self._delta_column_cache.get(key)
             if cached_column is not None:
                 index_tensor = torch.as_tensor(relative_indices, dtype=torch.long)
